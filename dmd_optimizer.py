@@ -172,3 +172,35 @@ def read_dumps(paths):
         files=paths,
         warnings=warnings,
     )
+
+
+# ---------------------------------------------------------------------------
+# Part 2: analysis
+# ---------------------------------------------------------------------------
+
+NO_MASK = 255  # mask number stored for a frame that uses no mask
+
+
+def _compared_pixels(frames, mask, shape):
+    """The pixels libserum compares: masked pixels removed, lit/unlit only in shape mode."""
+    data = np.asarray(frames, np.uint8)
+    if mask is not None:
+        data = data[..., np.asarray(mask) == 0]
+    if shape:
+        data = np.minimum(data, 1)
+    return np.ascontiguousarray(data)
+
+
+def frame_hash(pixels, mask=None, shape=False):
+    """CRC32 of one frame as libserum computes it.
+
+    pixels is uint8 [pixels]; mask marks ignored pixels with non-zero values, or
+    is None; with shape=True every lit pixel counts as 1.
+    """
+    return zlib.crc32(_compared_pixels(pixels, mask, shape)) & 0xFFFFFFFF
+
+
+def frame_hashes(frames, mask=None, shape=False):
+    """frame_hash of every row of frames [n, pixels], as uint32 [n]."""
+    rows = _compared_pixels(frames, mask, shape)
+    return np.fromiter((zlib.crc32(row) for row in rows), np.uint32, len(rows))
