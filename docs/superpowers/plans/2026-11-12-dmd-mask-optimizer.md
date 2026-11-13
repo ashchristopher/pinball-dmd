@@ -594,7 +594,7 @@ Append to `dmd_optimizer.py`:
 
 SUPPORTED_SIZES = ((128, 32), (192, 64))
 
-_TIMESTAMP = re.compile(rb"^0x([0-9A-Fa-f]{8})[ \t]*$", re.MULTILINE)
+_TIMESTAMP = re.compile(rb"^0x([0-9A-Fa-f]{8})[ \t]*\r?$", re.MULTILINE)
 _PIXEL_VALUE = np.full(256, 255, np.uint8)
 for _value, _char in enumerate(b"0123456789abcdef"):
     _PIXEL_VALUE[_char] = _value
@@ -610,15 +610,15 @@ def parse_dump_text(data, name):
     milliseconds, and warning is None or a message saying where reading stopped.
     Blank lines are ignored everywhere, as ColorizingDMD ignores them.
     """
-    data = data.replace(b"\r", b"")
     marks = list(_TIMESTAMP.finditer(data))
     size = None
-    frames = []
+    frames = None
     times = []
     warning = None
     for number, mark in enumerate(marks, start=1):
         end = marks[number].start() if number < len(marks) else len(data)
-        lines = [line for line in data[mark.end():end].split(b"\n") if line]
+        lines = [line.rstrip(b"\r") for line in data[mark.end():end].split(b"\n")]
+        lines = [line for line in lines if line]
         if size is None:
             if not lines:
                 break
@@ -633,6 +633,7 @@ def parse_dump_text(data, name):
                     "(supported sizes are 128x32 and 192x64)"
                 )
             size = (width, height)
+            frames = np.empty((len(marks), width * height), np.uint8)
         width, height = size
         rows = lines[:height]
         pixels = None
@@ -643,14 +644,16 @@ def parse_dump_text(data, name):
         if pixels is None:
             warning = f"{name}: record {number} is incomplete or invalid; reading stopped there"
             break
-        frames.append(pixels)
+        frames[len(times)] = pixels
         times.append(int(mark.group(1), 16))
         if len(lines) > height:
             warning = f"{name}: unexpected text after record {number}; reading stopped there"
             break
-    if not frames:
+    if not times:
         raise OptimizerError(f"{name}: no complete frame found")
-    return np.stack(frames), np.array(times, np.uint32), size, warning
+    if len(times) < len(frames):
+        frames = frames[:len(times)].copy()  # give the unused part back
+    return frames, np.array(times, np.uint32), size, warning
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
@@ -681,6 +684,8 @@ Files:
 Design section 6. `read_dumps` reads one or more files into a `Dump`: the distinct frames in order of first appearance, and for every record its distinct frame number, timestamp, duration and file.
 
 The duration rule is ColorizingDMD's: the time to the next record, or 30 ms when there is no next record in the file, when the next timestamp is earlier, or when the gap is over 4000 ms.
+
+Duplicates are removed file by file, and the text of a file is released as soon as it is parsed, so only one file's records are in memory at a time.
 
 The tests cover:
 
@@ -803,14 +808,19 @@ def read_dumps(paths):
     """Read dump files, in the order given, into one Dump."""
     paths = [str(path) for path in paths]
     size = None
-    parts = []
+    index = {}  # pixels of a distinct frame -> its number
+    record_frame = []
+    times = []
+    durations = []
+    files = []
     warnings = []
-    for path in paths:
+    for number, path in enumerate(paths):
         try:
             data = Path(path).read_bytes()
         except OSError as error:
             raise OptimizerError(f"{path}: cannot read the file ({error.strerror})") from None
-        frames, times, file_size, warning = parse_dump_text(data, path)
+        frames, file_times, file_size, warning = parse_dump_text(data, path)
+        del data  # the text of a dump is several times larger than its frames
         if size is None:
             size = file_size
         elif file_size != size:
@@ -820,12 +830,11 @@ def read_dumps(paths):
             )
         if warning:
             warnings.append(warning)
-        parts.append((frames, times))
-    index = {}
-    record_frame = []
-    for frames, _ in parts:
         for row in frames:
             record_frame.append(index.setdefault(row.tobytes(), len(index)))
+        times.append(file_times)
+        durations.append(frame_durations(file_times))
+        files.append(np.full(len(file_times), number, np.int64))
     width, height = size
     distinct = np.frombuffer(b"".join(index), np.uint8).reshape(len(index), width * height)
     return Dump(
@@ -834,11 +843,9 @@ def read_dumps(paths):
         shades=16 if int(distinct.max()) > 3 else 4,
         frames=distinct,
         record_frame=np.array(record_frame, np.int64),
-        record_time=np.concatenate([times for _, times in parts]),
-        record_duration=np.concatenate([frame_durations(times) for _, times in parts]),
-        record_file=np.concatenate(
-            [np.full(len(times), number, np.int64) for number, (_, times) in enumerate(parts)]
-        ),
+        record_time=np.concatenate(times),
+        record_duration=np.concatenate(durations),
+        record_file=np.concatenate(files),
         files=paths,
         warnings=warnings,
     )
@@ -945,8 +952,10 @@ def _compared_pixels(frames, mask, shape):
     """The pixels libserum compares: masked pixels removed, lit/unlit only in shape mode."""
     data = np.asarray(frames, np.uint8)
     if mask is not None:
-        data = data[..., np.asarray(mask) == 0]
-    if shape:
+        data = np.ascontiguousarray(data[..., np.asarray(mask) == 0])  # a copy, safe to change
+        if shape:
+            np.minimum(data, 1, out=data)
+    elif shape:
         data = np.minimum(data, 1)
     return np.ascontiguousarray(data)
 
@@ -960,10 +969,14 @@ def frame_hash(pixels, mask=None, shape=False):
     return zlib.crc32(_compared_pixels(pixels, mask, shape)) & 0xFFFFFFFF
 
 
+def _row_hashes(rows):
+    """CRC32 of every row of compared pixels, as uint32 [n]."""
+    return np.fromiter((zlib.crc32(row) for row in rows), np.uint32, len(rows))
+
+
 def frame_hashes(frames, mask=None, shape=False):
     """frame_hash of every row of frames [n, pixels], as uint32 [n]."""
-    rows = _compared_pixels(frames, mask, shape)
-    return np.fromiter((zlib.crc32(row) for row in rows), np.uint32, len(rows))
+    return _row_hashes(_compared_pixels(frames, mask, shape))
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
@@ -1596,6 +1609,10 @@ class Labeller:
     mask is the sum of the hashes of its unmasked cells, read from a table of
     sums so that a rectangle costs four lookups per frame. Hash collisions are
     possible in theory, which is why step E re-checks every result pixel by pixel.
+
+    The table takes 8 bytes per cell and frame, twice the size of the frames
+    themselves. With one Labeller per view it is the largest block of memory the
+    tool holds; the README states the totals.
     """
 
     def __init__(self, view, width, height):
@@ -1668,6 +1685,8 @@ Design section 7.3, step B. `Workspace` holds the frames and the current groups 
 
 `mergeable(candidate)` returns which classes under the candidate may be merged and how many frames that saves. A class is mergeable when it holds two or more current groups, every such group has a mask inside the candidate's mask and a view that is not looser, and the merged class would pass rules R2 (varying area) and R3 (lit pixels outside the mask).
 
+`varying_batches` finds the pixels at which the members of each class (or group) differ. It copies at most `BATCH_FRAMES` frames at a time, so memory does not grow with the size of the dump.
+
 R2 and R3 depend only on which frames are in a class, and classes never change. Their result is therefore computed once per candidate and kept in `candidate.sound`. Because of that cache, a `Candidate` belongs to the workspace that first judged it. Create candidates per workspace and never share one between two workspaces; the tests follow this rule.
 
 The tests cover:
@@ -1679,6 +1698,7 @@ The tests cover:
 - frames with nothing lit outside the region are not merged (R3), unless `min_lit` is 0
 - a group blocks a region that does not contain its mask, and a region that contains it absorbs the group
 - a value-view candidate cannot absorb a shape-view group
+- `varying_batches` gives the same answer for any batch size
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1707,6 +1727,25 @@ def no_mask_shape():
 
 
 SCORE = rectangle(38, 20, 66, 30)  # covers the six score digits drawn by score_frames
+
+
+def test_varying_batches_give_the_same_answer_for_any_batch_size(monkeypatch):
+    rng = np.random.default_rng(4)
+    frames = rng.integers(0, 4, size=(40, 30), dtype=np.uint8)
+    frames[10:20] = frames[10]  # a run of identical frames
+    order = rng.permutation(40)
+    starts = np.array([0, 1, 4, 5, 17, 30, 39])  # runs of 1, 3, 1, 12, 13, 9 and 1 frames
+    ends = list(starts[1:]) + [40]
+    expected = np.array([(frames[order[a:b]] != frames[order[a]]).any(axis=0) for a, b in zip(starts, ends)])
+    for size in (1, 2, 5, 13, 14, 1000):
+        monkeypatch.setattr(tool, "BATCH_FRAMES", size)
+        result = np.zeros_like(expected)
+        seen = []
+        for first, differ in tool.varying_batches(frames, order, starts):
+            result[first:first + len(differ)] = differ
+            seen.extend(range(first, first + len(differ)))
+        assert seen == list(range(7)), size  # every run exactly once, in order
+        assert np.array_equal(result, expected), size
 
 
 def test_flicker_is_merged_by_the_shape_view_without_a_mask(tmp_path):
@@ -1787,7 +1826,7 @@ def test_a_value_view_region_cannot_absorb_a_shape_view_group(tmp_path):
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `uv run --with pytest --with numpy pytest -q tests/test_workspace.py`
-Expected: `7 failed`, with `AttributeError: module 'dmd_optimizer' has no attribute 'Workspace'`.
+Expected: `8 failed`, with `AttributeError: module 'dmd_optimizer' has no attribute 'Workspace'`.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -1807,6 +1846,26 @@ class Candidate:
     sound: np.ndarray | None = None  # classes that pass rules R2 and R3, filled on first use
 
 
+BATCH_FRAMES = 4096  # frames copied at a time when the members of classes or groups are compared
+
+
+def varying_batches(frames, order, starts):
+    """Find where the frames of each run differ, copying a bounded number of frames at a time.
+
+    order lists frame numbers and a run begins at every index in starts. Yields
+    (first, differ) for consecutive batches of runs: differ is bool [runs, pixels]
+    for the runs first, first + 1, ..., True where the frames of a run differ in value.
+    """
+    ends = np.append(starts[1:], len(order))
+    first = 0
+    while first < len(starts):
+        last = max(first + 1, int(np.searchsorted(ends, starts[first] + BATCH_FRAMES, side="right")))
+        rows = frames[order[starts[first]:ends[last - 1]]]
+        local = starts[first:last] - starts[first]
+        yield first, np.maximum.reduceat(rows, local, axis=0) != np.minimum.reduceat(rows, local, axis=0)
+        first = last
+
+
 class Workspace:
     """The frames and the current groups during steps B to D of the design."""
 
@@ -1817,9 +1876,6 @@ class Workspace:
         count, pixels = self.frames.shape
         self.limit = options.limit(pixels)
         self.min_lit = options.lit_needed(pixels)
-        self.labellers = {False: Labeller(self.frames, self.width, self.height)}
-        if options.shape_mode:
-            self.labellers[True] = Labeller(shape_view(self.frames), self.width, self.height)
         lit = self.frames > 0
         rows, columns = self.height // CELL, self.width // CELL
         self.lit_cells = (
@@ -1828,6 +1884,11 @@ class Workspace:
             .reshape(count, rows * columns)
         )
         self.lit_total = lit.sum(axis=1)
+        self.labellers = {False: Labeller(self.frames, self.width, self.height)}
+        if options.shape_mode:
+            # lit, read as bytes, is the shape view; using it saves a copy as large as the frames
+            self.labellers[True] = Labeller(lit.view(np.uint8), self.width, self.height)
+        del lit
         self.root = np.arange(count)  # kept frame of the group each frame belongs to
         self.group_mask = np.full(count, -1)  # pool index of that group's mask, -1 for no mask
         self.group_shape = np.zeros(count, bool)  # True when that group uses the shape view
@@ -1893,11 +1954,11 @@ class Workspace:
             frames = frames[np.argsort(labels[frames], kind="stable")]
             classes = labels[frames]
             starts = np.flatnonzero(np.concatenate(([True], classes[1:] != classes[:-1])))
-            rows = self.frames[frames]
-            differ = np.maximum.reduceat(rows, starts, axis=0) != np.minimum.reduceat(rows, starts, axis=0)
-            if candidate.mask is not None:
-                differ &= ~candidate.mask
-            sound[classes[starts]] = differ.sum(axis=1) + candidate.area <= self.limit
+            for first, differ in varying_batches(self.frames, frames, starts):
+                if candidate.mask is not None:
+                    differ &= ~candidate.mask
+                batch = classes[starts[first:first + len(differ)]]
+                sound[batch] = differ.sum(axis=1) + candidate.area <= self.limit
         return sound
 
     def apply(self, candidate, labels, good):
@@ -1922,10 +1983,10 @@ class Workspace:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `uv run --with pytest --with numpy pytest -q tests/test_workspace.py`
-Expected: `7 passed`.
+Expected: `8 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `61 passed`.
+Expected: `62 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -2095,7 +2156,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_choose_masks.py`
 Expected: `8 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `69 passed`.
+Expected: `70 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -2239,8 +2300,9 @@ def _group_table(work):
     kept, group, sizes = np.unique(work.root, return_inverse=True, return_counts=True)
     order = np.argsort(group, kind="stable")
     starts = np.concatenate(([0], np.cumsum(sizes)[:-1]))
-    rows = work.frames[order]
-    varying = np.maximum.reduceat(rows, starts, axis=0) != np.minimum.reduceat(rows, starts, axis=0)
+    varying = np.zeros((len(kept), work.frames.shape[1]), bool)
+    for first, differ in varying_batches(work.frames, order, starts):
+        varying[first:first + len(differ)] = differ
     return kept, group, sizes, order, starts, varying
 
 
@@ -2283,7 +2345,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_tighten.py`
 Expected: `6 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `75 passed`.
+Expected: `76 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -2304,7 +2366,7 @@ Files:
 
 Design section 7.3, step E. `finish` drops regions no group uses, numbers the masks by frames saved, builds the `Group` and `Analysis` objects and calls `verify_groups`.
 
-`verify_groups` is the safety net of the whole tool. It identifies every distinct frame the way libserum does (by CRC32 under every mask and shape flag in use) and then compares pixels. Every frame must match exactly one kept frame, the one of its own group; otherwise it raises `OptimizerError` and no files are written. A hash match with different pixels is a CRC32 collision, which is returned as a warning.
+`verify_groups` is the safety net of the whole tool. It identifies every distinct frame the way libserum does (by CRC32 under every mask and shape flag in use) and then compares pixels. Every frame must match exactly one kept frame, the one of its own group; otherwise it raises `OptimizerError` and no files are written. A hash match with different pixels is a CRC32 collision, which is returned as a warning. The frames are checked `BATCH_FRAMES` at a time to bound memory.
 
 The tests cover:
 
@@ -2468,23 +2530,27 @@ def verify_groups(frames, groups, masks):
     collisions = []
     for (mask_number, shape), numbers in sorted(by_setting.items()):
         mask = None if mask_number == NO_MASK else masks[mask_number]
-        rows = _compared_pixels(frames, mask, shape)
-        hashes = frame_hashes(frames, mask, shape).tolist()
+        kept = np.array([groups[number].kept for number in numbers])
+        kept_rows = _compared_pixels(frames[kept], mask, shape)
         by_hash = {}
-        for number in numbers:
-            groups[number].hash = hashes[groups[number].kept]
-            by_hash.setdefault(groups[number].hash, []).append(number)
-        for frame, value in enumerate(hashes):
-            for number in by_hash.get(value, ()):
-                kept = groups[number].kept
-                if not np.array_equal(rows[frame], rows[kept]):
-                    collisions.append((frame, kept))
-                    continue
-                matches[frame] += 1
-                if own[frame] != number:
-                    raise OptimizerError(
-                        defect.format(f"frame {frame} matches the kept frame {kept} of another group")
-                    )
+        for position, value in enumerate(_row_hashes(kept_rows).tolist()):
+            groups[numbers[position]].hash = value
+            by_hash.setdefault(value, []).append(position)
+        for start in range(0, len(frames), BATCH_FRAMES):  # a bounded number of frames at a time
+            rows = _compared_pixels(frames[start:start + BATCH_FRAMES], mask, shape)
+            for offset, value in enumerate(_row_hashes(rows).tolist()):
+                for position in by_hash.get(value, ()):
+                    frame, number = start + offset, numbers[position]
+                    if not np.array_equal(rows[offset], kept_rows[position]):
+                        collisions.append((frame, int(kept[position])))
+                        continue
+                    matches[frame] += 1
+                    if own[frame] != number:
+                        raise OptimizerError(
+                            defect.format(
+                                f"frame {frame} matches the kept frame {int(kept[position])} of another group"
+                            )
+                        )
     wrong = np.flatnonzero(matches != 1)
     if len(wrong):
         raise OptimizerError(
@@ -2534,7 +2600,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_finish.py`
 Expected: `8 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `83 passed`.
+Expected: `84 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -2554,7 +2620,7 @@ Files:
 - Test: `tests/test_analyze.py`
 - Test: `tests/test_helpers.py`
 
-Design section 7. `analyze` runs steps A to E in order. Candidate regions are collected from the value view first and then from the shape view, without duplicates. The tests in `tests/test_analyze.py` are the scenarios of design section 12.1, and each result is checked with `check_rules`.
+Design section 7. `analyze` runs steps A to E in order. Candidate regions are collected from the value view first and then from the shape view, without duplicates. The labellers hold the largest tables in memory, so `analyze` releases them before step E, which does not need them. The tests in `tests/test_analyze.py` are the scenarios of design section 12.1, and each result is checked with `check_rules`.
 
 `tests/test_helpers.py` tests the test helpers themselves. `check_rules` decides whether a result is right, so it must reject wrong results: a group split in two, a looser view than needed, a result over the limits, a wrong order, a missing frame and a wrong hash. `hand_labels` is the measure used by the Twister benchmark in Task 19.
 
@@ -2837,20 +2903,20 @@ def analyze(dump, options=None, progress=None):
     if options.max_masks > 0 and work.limit > 0:
         say("finding candidate regions")
         links = timeline_links(dump)
-        views = [dump.frames]
-        if options.shape_mode:
-            views.append(shape_view(dump.frames))
         seen = set()
-        for view in views:
+        for shape in (False, True) if options.shape_mode else (False,):
+            view = shape_view(dump.frames) if shape else dump.frames
             for region in candidate_regions(view, links, work.limit, dump.width, dump.height):
                 key = region.tobytes()
                 if key not in seen:
                     seen.add(key)
                     regions.append(region)
+        view = None  # the shape view is as large as the frames; do not keep it
     say(f"choosing masks from {len(regions)} candidate regions")
     choose_masks(work, regions, options)
     say("tightening settings")
     tighten(work, options)
+    work.labellers.clear()  # the largest tables in memory; step E does not use them
     say("verifying")
     return finish(work, options)
 ```
@@ -2861,7 +2927,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_analyze.py tests/te
 Expected: `22 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `105 passed`.
+Expected: `106 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -3222,7 +3288,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_project_files.py`
 Expected: `8 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `113 passed`.
+Expected: `114 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -3501,7 +3567,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_new_project.py`
 Expected: `27 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `140 passed`.
+Expected: `141 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -3876,7 +3942,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_report.py`
 Expected: `10 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `150 passed`.
+Expected: `151 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -3935,6 +4001,7 @@ The tests cover:
 - a symbolic link that points nowhere counts as an existing file and is put back after a failed forced run
 - `--force` replaces all three files, leaves no extra files and does not touch other files of the user
 - every failed run prints exactly one error line, last on standard error
+- running out of memory is reported in one line
 - two runs give byte-identical files (rule R7)
 - `--help` lists every option
 
@@ -4082,6 +4149,18 @@ def test_a_failed_run_leaves_nothing_behind(dump_path, tmp_path, capsys, monkeyp
     (out / "notes.txt").write_text("keep me")
     assert tool.main([str(dump_path), "--out-dir", str(out)]) == 1
     assert files_in(out) == ["notes.txt"]
+
+
+def test_running_out_of_memory_is_reported_in_one_line(dump_path, tmp_path, capsys, monkeypatch):
+    def exhausted(*arguments):
+        raise MemoryError()
+
+    monkeypatch.setattr(tool, "analyze", exhausted)
+    out = tmp_path / "out"
+    assert tool.main([str(dump_path), "--out-dir", str(out)]) == 1
+    captured = capsys.readouterr()
+    assert error_message(captured).startswith("not enough memory. Allow about 60 KB per distinct 128x32 frame")
+    assert captured.out == "" and not out.exists()
 
 
 def test_write_problems_are_reported(dump_path, tmp_path, capsys):
@@ -4320,7 +4399,7 @@ def test_help_lists_every_option(capsys):
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `uv run --with pytest --with numpy pytest -q tests/test_cli.py`
-Expected: `39 failed`, with `AttributeError: module 'dmd_optimizer' has no attribute 'main'`.
+Expected: `40 failed`, with `AttributeError: module 'dmd_optimizer' has no attribute 'main'`.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -4486,6 +4565,13 @@ def main(argv=None):
     except OptimizerError as error:
         print(f"dmd_optimizer: error: {error}", file=sys.stderr)
         return 1
+    except MemoryError:
+        print(
+            "dmd_optimizer: error: not enough memory. Allow about 60 KB per distinct 128x32 frame "
+            "and 180 KB per distinct 192x64 frame, or give the tool fewer dump files at once",
+            file=sys.stderr,
+        )
+        return 1
 
 
 if __name__ == "__main__":
@@ -4495,10 +4581,10 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `uv run --with pytest --with numpy pytest -q tests/test_cli.py`
-Expected: `39 passed`.
+Expected: `40 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `189 passed`.
+Expected: `191 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -4713,7 +4799,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_tools.py`
 Expected: `4 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `193 passed`.
+Expected: `195 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -4970,7 +5056,7 @@ The numbers 4116, 43 and 196 of 7682 are exact for this dump. If they differ, or
 - [ ] **Step 6: Run the fast tests**
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `193 passed`, with 6 deselected.
+Expected: `195 passed`, with 6 deselected.
 
 - [ ] **Step 7: Commit**
 
@@ -5238,7 +5324,7 @@ If the library reports a problem, the assertion shows a list of `(record, kind, 
 - [ ] **Step 5: Run the fast tests**
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `193 passed`, with 8 deselected.
+Expected: `195 passed`, with 8 deselected.
 
 - [ ] **Step 6: Commit**
 
@@ -5291,6 +5377,14 @@ Several dumps of the same ROM can be given at once. The output goes to
 | `<rom>.cRP` | Loaded by the editor together with the `.cROM` |
 | `<rom>-report.html` | Shows every merged group; open it in a browser |
 
+## Memory and time
+
+The tool keeps every distinct frame in memory several times over. Allow about 60 KB
+per distinct 128x32 frame and about 180 KB per distinct 192x64 frame. The Twister
+dump used for testing has 14,443 frames, 10,301 of them distinct: it needs about
+0.6 GB and one minute. Several dumps given at once are read one after the other, so
+only their distinct frames add up.
+
 ## Options
 
 | Option | Default | Meaning |
@@ -5335,10 +5429,10 @@ This prints every header value and field that differs between two projects.
 - [ ] **Step 2: Run every test**
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `193 passed`, with 8 deselected.
+Expected: `195 passed`, with 8 deselected.
 
 Run: `uv run --with pytest --with numpy pytest -q -s -m "twister or libserum"`
-Expected: `8 passed`, with 193 deselected. This takes two to three minutes.
+Expected: `8 passed`, with 195 deselected. This takes two to three minutes.
 
 - [ ] **Step 3: Run the tool on the Twister dump**
 
@@ -5396,7 +5490,7 @@ Differences in `cRP TimeElapsed` and in the editor interface state fields listed
 
 The work is complete when:
 
-- `uv run --with pytest --with numpy pytest -q` prints `193 passed`;
+- `uv run --with pytest --with numpy pytest -q` prints `195 passed`;
 - `uv run --with pytest --with numpy pytest -q -s -m "twister or libserum"` prints `8 passed`;
 - the two hand-offs of Tasks 20 and 22 have been given to the user.
 

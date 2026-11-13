@@ -571,6 +571,7 @@ The tool stops with one error message, exit status 1, and no output files when:
 - the frame size is not 128x32 or 192x64, or the dumps differ in size;
 - an option value is out of range, or the ROM name is not usable (section 5);
 - the output files cannot be written;
+- the machine runs out of memory;
 - an output file exists and `--force` was not given, or a folder has the name of an
   output file;
 - the verification in step E fails. This means a defect in the tool, and the message
@@ -726,8 +727,11 @@ The test is skipped when the library has not been built.
   kept frames, the chance that some dump frame's hash collides with an unrelated kept
   frame is roughly 1% per run. The tool reports collisions; it cannot avoid them
   within the file format.
-- **Size of dumps.** Time and memory were measured only on the Twister dump. Both
-  grow with the number of distinct frames times the number of candidate regions.
+- **Size of dumps.** Memory grows with the number of distinct frames: about 60 KB per
+  distinct 128x32 frame and about 180 KB per distinct 192x64 frame. The Twister dump
+  (10,301 distinct frames) needs about 0.6 GB and one minute. Larger inputs were not
+  measured. Time grows with the number of distinct frames times the number of
+  candidate regions. Running out of memory ends the run with one error line.
 
 ## Appendix: sources used
 
