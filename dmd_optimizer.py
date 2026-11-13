@@ -789,3 +789,183 @@ def analyze(dump, options=None, progress=None):
     work.labellers.clear()  # the largest tables in memory; step E does not use them
     say("verifying")
     return finish(work, options)
+
+
+# ---------------------------------------------------------------------------
+# Part 3: project files
+# ---------------------------------------------------------------------------
+
+HEADER_LENGTH = 80  # format marker of ColorizingDMD v3.17.3, not a byte count
+SPRITE_PIXELS = 256 * 64
+_CROM_HEADER = struct.Struct("<64s9IHI")
+_HEADER_FIELDS = (
+    "name", "header_length", "fWidth", "fHeight", "fWidthX", "fHeightX",
+    "nFrames", "noColors", "nCompMasks", "nSprites", "nBackgrounds", "is256x64",
+)
+
+
+def _crom_layout(header):
+    """The fields that follow the .cROM header, in file order: (name, dtype, count)."""
+    frames = header["nFrames"]
+    masks = header["nCompMasks"]
+    sprites = header["nSprites"]
+    backgrounds = header["nBackgrounds"]
+    pixels = header["fWidth"] * header["fHeight"]
+    extra = header["fWidthX"] * header["fHeightX"]
+    shades = header["noColors"]
+    return [
+        ("HashCode", "<u4", frames),
+        ("ShapeCompMode", "u1", frames),
+        ("CompMaskID", "u1", frames),
+        ("CompMasks", "u1", masks * pixels),
+        ("isExtraFrame", "u1", frames),
+        ("cFrames", "<u2", frames * pixels),
+        ("cFramesX", "<u2", frames * extra),
+        ("DynaMasks", "u1", frames * pixels),
+        ("DynaMasksX", "u1", frames * extra),
+        ("Dyna4Cols", "<u2", frames * 32 * shades),
+        ("Dyna4ColsX", "<u2", frames * 32 * shades),
+        ("isExtraSprite", "u1", sprites),
+        ("FrameSprites", "u1", frames * 32),
+        ("SpriteOriginal", "u1", sprites * SPRITE_PIXELS),
+        ("SpriteColored", "<u2", sprites * SPRITE_PIXELS),
+        ("SpriteMaskX", "u1", sprites * SPRITE_PIXELS),
+        ("SpriteColoredX", "<u2", sprites * SPRITE_PIXELS),
+        ("ActiveFrames", "u1", frames),
+        ("ColorRotations", "<u2", frames * 4 * 64),
+        ("ColorRotationsX", "<u2", frames * 4 * 64),
+        ("SpriteDetDwords", "<u4", sprites * 4),
+        ("SpriteDetDwordPos", "<u2", sprites * 4),
+        ("SpriteDetAreas", "<u2", sprites * 4 * 4),
+        ("TriggerID", "<u4", frames),
+        ("FrameSpriteBB", "<u2", frames * 32 * 4),
+        ("isExtraBackground", "u1", backgrounds),
+        ("BackgroundFrames", "<u2", backgrounds * pixels),
+        ("BackgroundFramesX", "<u2", backgrounds * extra),
+        ("BackgroundID", "<u2", frames),
+        ("BackgroundMask", "u1", frames * pixels),
+        ("BackgroundMaskX", "u1", frames * extra),
+        ("DynaShadowsDirO", "u1", frames * 32),
+        ("DynaShadowsColO", "<u2", frames * 32),
+        ("DynaShadowsDirX", "u1", frames * 32),
+        ("DynaShadowsColX", "<u2", frames * 32),
+        ("DynaSprite4Cols", "<u2", sprites * 9 * shades),
+        ("DynaSprite4ColsX", "<u2", sprites * 9 * shades),
+        ("DynaSpriteMasks", "u1", sprites * SPRITE_PIXELS),
+        ("DynaSpriteMasksX", "u1", sprites * SPRITE_PIXELS),
+        ("SpriteShapeMode", "u1", sprites),
+    ]
+
+
+def _first(value):
+    return int(value) if np.ndim(value) == 0 else int(value[0])
+
+
+def _crp_layout(header):
+    """The fields of the .cRP file, in file order: (name, dtype, count)."""
+    frames = header["nFrames"]
+    pixels = header["fWidth"] * header["fHeight"]
+    return [
+        ("name", "u1", 64),
+        ("oFrames", "u1", frames * pixels),
+        ("activeColSet", "<u4", 64),
+        ("ColSets", "<u2", 64 * 16),
+        ("acColSet", "u1", 1),
+        ("preColSet", "u1", 1),
+        ("nameColSet", "u1", 64 * 64),
+        ("DrawColMode", "<u4", 1),
+        ("Draw_Mode", "u1", 1),
+        ("Mask_Sel_Mode", "<i4", 1),
+        ("Fill_Mode", "<u4", 1),
+        ("Mask_Names", "u1", 64 * 32),
+        ("nSections", "<u4", 1),
+        ("Section_Firsts", "<u4", 512),
+        ("Section_Names", "u1", 512 * 32),
+        ("Sprite_Names", "u1", 255 * 32),
+        ("Sprite_Col_From_Frame", "<u4", 255),
+        ("FrameDuration", "<u4", frames),
+        ("SpriteRect", "<u2", 255 * 4),
+        ("SpriteRectMirror", "<u4", 255 * 2),
+        ("Palette", "<u2", 256 * 64),
+        ("acEditColorsS", "<u2", 16),
+        ("nImagePosSaves", "<u4", 1),
+        ("ImagePosSaveName", "u1", 256 * 64),
+        ("ImagePosSave", "<i4", 256 * 16),
+        ("PalNames", "u1", 256 * 64),
+        ("isImported", "<u4", 1),
+        ("importedPal", "u1", lambda fields: _first(fields["isImported"]) * 64 * 3),
+        ("TimeElapsed", "<u4", 1),
+        ("isPupPack", "<u4", 1),
+        ("PupPack", "<u2", 256),
+    ]
+
+
+@dataclass
+class Project:
+    """A ColorizingDMD project in memory.
+
+    header holds the values of the .cROM header. crom and crp map field names to
+    numpy arrays; an int in place of an array means "every element has this value".
+    """
+
+    header: dict
+    crom: dict
+    crp: dict
+
+
+def _read_fields(stream, layout, path):
+    fields = {}
+    for name, dtype, count in layout:
+        if callable(count):
+            count = count(fields)
+        data = np.fromfile(stream, dtype, count)
+        if len(data) != count:
+            raise OptimizerError(f"{path}: the file ends inside the field {name}")
+        fields[name] = data
+    if stream.read(1):
+        raise OptimizerError(f"{path}: unexpected data after the last field")
+    return fields
+
+
+def read_project(crom_path, crp_path):
+    """Read a .cROM and its .cRP as written by ColorizingDMD v3.17.3."""
+    with open(crom_path, "rb") as stream:
+        raw = stream.read(_CROM_HEADER.size)
+        if len(raw) < _CROM_HEADER.size:
+            raise OptimizerError(f"{crom_path}: the file is too short to be a .cROM")
+        header = dict(zip(_HEADER_FIELDS, _CROM_HEADER.unpack(raw)))
+        if header["header_length"] != HEADER_LENGTH or header["is256x64"]:
+            raise OptimizerError(
+                f"{crom_path}: unsupported project format (header length "
+                f"{header['header_length']}, is256x64 {header['is256x64']})"
+            )
+        crom = _read_fields(stream, _crom_layout(header), crom_path)
+    with open(crp_path, "rb") as stream:
+        crp = _read_fields(stream, _crp_layout(header), crp_path)
+    return Project(header=header, crom=crom, crp=crp)
+
+
+def _write_fields(stream, layout, fields):
+    for name, dtype, count in layout:
+        if callable(count):
+            count = count(fields)
+        value = fields[name]
+        if np.ndim(value) == 0:
+            chunk = np.full(min(count, 1 << 20), value, dtype)
+            for start in range(0, count, len(chunk) or 1):
+                chunk[:count - start].tofile(stream)
+            continue
+        data = np.ascontiguousarray(value, dtype)
+        if data.size != count:
+            raise ValueError(f"field {name} has {data.size} values, expected {count}")
+        data.tofile(stream)
+
+
+def write_project(project, crom_path, crp_path):
+    """Write a project as a .cROM and a .cRP in the layout of ColorizingDMD v3.17.3."""
+    header = project.header
+    with open(crom_path, "wb") as stream:
+        stream.write(_CROM_HEADER.pack(*(header[name] for name in _HEADER_FIELDS)))
+        _write_fields(stream, _crom_layout(header), project.crom)
+    with open(crp_path, "wb") as stream:
+        _write_fields(stream, _crp_layout(header), project.crp)
