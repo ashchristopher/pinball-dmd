@@ -40,7 +40,7 @@ class OptimizerError(Exception):
 
 SUPPORTED_SIZES = ((128, 32), (192, 64))
 
-_TIMESTAMP = re.compile(rb"^0x([0-9A-Fa-f]{8})[ \t]*$", re.MULTILINE)
+_TIMESTAMP = re.compile(rb"^0x([0-9A-Fa-f]{8})[ \t]*\r?$", re.MULTILINE)
 _PIXEL_VALUE = np.full(256, 255, np.uint8)
 for _value, _char in enumerate(b"0123456789abcdef"):
     _PIXEL_VALUE[_char] = _value
@@ -56,15 +56,15 @@ def parse_dump_text(data, name):
     milliseconds, and warning is None or a message saying where reading stopped.
     Blank lines are ignored everywhere, as ColorizingDMD ignores them.
     """
-    data = data.replace(b"\r", b"")
     marks = list(_TIMESTAMP.finditer(data))
     size = None
-    frames = []
+    frames = None
     times = []
     warning = None
     for number, mark in enumerate(marks, start=1):
         end = marks[number].start() if number < len(marks) else len(data)
-        lines = [line for line in data[mark.end():end].split(b"\n") if line]
+        lines = [line.rstrip(b"\r") for line in data[mark.end():end].split(b"\n")]
+        lines = [line for line in lines if line]
         if size is None:
             if not lines:
                 break
@@ -79,6 +79,7 @@ def parse_dump_text(data, name):
                     "(supported sizes are 128x32 and 192x64)"
                 )
             size = (width, height)
+            frames = np.empty((len(marks), width * height), np.uint8)
         width, height = size
         rows = lines[:height]
         pixels = None
@@ -89,14 +90,16 @@ def parse_dump_text(data, name):
         if pixels is None:
             warning = f"{name}: record {number} is incomplete or invalid; reading stopped there"
             break
-        frames.append(pixels)
+        frames[len(times)] = pixels
         times.append(int(mark.group(1), 16))
         if len(lines) > height:
             warning = f"{name}: unexpected text after record {number}; reading stopped there"
             break
-    if not frames:
+    if not times:
         raise OptimizerError(f"{name}: no complete frame found")
-    return np.stack(frames), np.array(times, np.uint32), size, warning
+    if len(times) < len(frames):
+        frames = frames[:len(times)].copy()  # give the unused part back
+    return frames, np.array(times, np.uint32), size, warning
 
 
 DEFAULT_FRAME_DURATION = 30  # ms, ColorizingDMD's value when a duration is unknown
@@ -133,14 +136,19 @@ def read_dumps(paths):
     """Read dump files, in the order given, into one Dump."""
     paths = [str(path) for path in paths]
     size = None
-    parts = []
+    index = {}  # pixels of a distinct frame -> its number
+    record_frame = []
+    times = []
+    durations = []
+    files = []
     warnings = []
-    for path in paths:
+    for number, path in enumerate(paths):
         try:
             data = Path(path).read_bytes()
         except OSError as error:
             raise OptimizerError(f"{path}: cannot read the file ({error.strerror})") from None
-        frames, times, file_size, warning = parse_dump_text(data, path)
+        frames, file_times, file_size, warning = parse_dump_text(data, path)
+        del data  # the text of a dump is several times larger than its frames
         if size is None:
             size = file_size
         elif file_size != size:
@@ -150,12 +158,11 @@ def read_dumps(paths):
             )
         if warning:
             warnings.append(warning)
-        parts.append((frames, times))
-    index = {}
-    record_frame = []
-    for frames, _ in parts:
         for row in frames:
             record_frame.append(index.setdefault(row.tobytes(), len(index)))
+        times.append(file_times)
+        durations.append(frame_durations(file_times))
+        files.append(np.full(len(file_times), number, np.int64))
     width, height = size
     distinct = np.frombuffer(b"".join(index), np.uint8).reshape(len(index), width * height)
     return Dump(
@@ -164,11 +171,9 @@ def read_dumps(paths):
         shades=16 if int(distinct.max()) > 3 else 4,
         frames=distinct,
         record_frame=np.array(record_frame, np.int64),
-        record_time=np.concatenate([times for _, times in parts]),
-        record_duration=np.concatenate([frame_durations(times) for _, times in parts]),
-        record_file=np.concatenate(
-            [np.full(len(times), number, np.int64) for number, (_, times) in enumerate(parts)]
-        ),
+        record_time=np.concatenate(times),
+        record_duration=np.concatenate(durations),
+        record_file=np.concatenate(files),
         files=paths,
         warnings=warnings,
     )
@@ -185,8 +190,10 @@ def _compared_pixels(frames, mask, shape):
     """The pixels libserum compares: masked pixels removed, lit/unlit only in shape mode."""
     data = np.asarray(frames, np.uint8)
     if mask is not None:
-        data = data[..., np.asarray(mask) == 0]
-    if shape:
+        data = np.ascontiguousarray(data[..., np.asarray(mask) == 0])  # a copy, safe to change
+        if shape:
+            np.minimum(data, 1, out=data)
+    elif shape:
         data = np.minimum(data, 1)
     return np.ascontiguousarray(data)
 
@@ -200,10 +207,14 @@ def frame_hash(pixels, mask=None, shape=False):
     return zlib.crc32(_compared_pixels(pixels, mask, shape)) & 0xFFFFFFFF
 
 
+def _row_hashes(rows):
+    """CRC32 of every row of compared pixels, as uint32 [n]."""
+    return np.fromiter((zlib.crc32(row) for row in rows), np.uint32, len(rows))
+
+
 def frame_hashes(frames, mask=None, shape=False):
     """frame_hash of every row of frames [n, pixels], as uint32 [n]."""
-    rows = _compared_pixels(frames, mask, shape)
-    return np.fromiter((zlib.crc32(row) for row in rows), np.uint32, len(rows))
+    return _row_hashes(_compared_pixels(frames, mask, shape))
 
 
 CELL = 2  # masks are aligned to cells of CELL x CELL pixels
@@ -360,6 +371,10 @@ class Labeller:
     mask is the sum of the hashes of its unmasked cells, read from a table of
     sums so that a rectangle costs four lookups per frame. Hash collisions are
     possible in theory, which is why step E re-checks every result pixel by pixel.
+
+    The table takes 8 bytes per cell and frame, twice the size of the frames
+    themselves. With one Labeller per view it is the largest block of memory the
+    tool holds; the README states the totals.
     """
 
     def __init__(self, view, width, height):
