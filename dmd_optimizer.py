@@ -1066,3 +1066,198 @@ def new_project(dump, analysis, rom_name):
         acEditColorsS=edit_colours,
     )
     return Project(header=header, crom=crom, crp=crp)
+
+
+# ---------------------------------------------------------------------------
+# Part 4: review report
+# ---------------------------------------------------------------------------
+
+REVIEW_FIRST = 20  # groups listed in the review-first section
+MEMBERS_SHOWN = 3  # other members pictured beside a kept frame
+
+_STYLE = """
+body { font-family: sans-serif; margin: 1.5em; background: #f4f4f4; color: #111; }
+table { border-collapse: collapse; margin-bottom: 1em; }
+td, th { border: 1px solid #bbb; padding: 0.2em 0.6em; text-align: left; }
+img { image-rendering: pixelated; background: #000; display: block; }
+details { background: #fff; border: 1px solid #bbb; margin: 0.6em 0; padding: 0.4em 0.8em; }
+summary { font-weight: bold; cursor: pointer; }
+.group { border-top: 1px solid #ddd; margin-top: 0.8em; padding-top: 0.4em; }
+.row { display: flex; flex-wrap: wrap; gap: 0.8em; }
+figure { margin: 0; }
+figcaption { font-size: 0.8em; color: #444; }
+"""
+
+
+def png_image(indexed, palette):
+    """An 8-bit palette PNG. indexed is uint8 [height, width]; palette is a list of (r, g, b)."""
+
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data))
+
+    height, width = indexed.shape
+    rows = np.concatenate([np.zeros((height, 1), np.uint8), indexed.astype(np.uint8)], axis=1)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 3, 0, 0, 0))
+        + chunk(b"PLTE", bytes(value for colour in palette for value in colour))
+        + chunk(b"IDAT", zlib.compress(rows.tobytes(), 9))
+        + chunk(b"IEND", b"")
+    )
+
+
+def _palette(shades):
+    """Palette of the report pictures: frame shades, the same shades marked as varying, mask outline."""
+    top = shades - 1
+    plain = [(255 * value // top, 127 * value // top, 0) for value in range(shades)]
+    marked = [(60 * value // top, 110 + 145 * value // top, 150 + 105 * value // top) for value in range(shades)]
+    return plain + marked + [(90, 120, 255)]
+
+
+def _outline(mask):
+    """The pixels on the inner edge of a mask given as bool [height, width]."""
+    inside = mask.copy()
+    inside[1:] &= mask[:-1]
+    inside[:-1] &= mask[1:]
+    inside[:, 1:] &= mask[:, :-1]
+    inside[:, :-1] &= mask[:, 1:]
+    inside[0] = inside[-1] = False
+    inside[:, 0] = inside[:, -1] = False
+    return mask & ~inside
+
+
+def summarize(dump, analysis):
+    """The summary numbers of a run, in the order they are shown."""
+    groups = analysis.groups
+    return {
+        "dump files read": len(dump.files),
+        "frames read": len(dump.record_frame),
+        "distinct frames": len(dump.frames),
+        "frames kept": len(groups),
+        "frames kept unmerged": sum(1 for group in groups if len(group.members) == 1),
+        "masks used": len(analysis.masks),
+        "frames merged by shape mode alone": sum(
+            len(group.members) - 1 for group in groups if group.mask == NO_MASK
+        ),
+    }
+
+
+def report_html(dump, analysis, rom_name):
+    """The review report as one self-contained HTML document."""
+    width, height, shades = dump.width, dump.height, dump.shades
+    pixels = width * height
+    palette = _palette(shades)
+    groups = analysis.groups
+    durations = kept_durations(dump, analysis)
+    frames_seen, first_record = np.unique(dump.record_frame, return_index=True)
+    first_time = np.zeros(len(dump.frames), np.uint32)
+    first_time[frames_seen] = dump.record_time[first_record]
+    position = {group.kept: number for number, group in enumerate(groups)}
+
+    def picture(indexed):
+        data = base64.b64encode(png_image(indexed.reshape(height, width), palette)).decode("ascii")
+        return f'<img src="data:image/png;base64,{data}" width="{width * 3}" height="{height * 3}" alt="">'
+
+    def mask_of(group):
+        return analysis.masks[group.mask] if group.mask != NO_MASK else np.zeros(pixels, bool)
+
+    def varying_area(group):
+        mask = mask_of(group)
+        return int(mask.sum() + (group.varying & ~mask).sum())
+
+    def group_block(number):
+        group = groups[number]
+        mask = mask_of(group)
+        kept = dump.frames[group.kept] + shades * group.varying
+        edge = _outline(mask.reshape(height, width)).reshape(-1) & ~group.varying
+        kept[edge] = 2 * shades
+        area = varying_area(group)
+        share = 100 * area // analysis.limit if analysis.limit else 0
+        figures = [
+            f"<figure>{picture(kept)}<figcaption>kept frame {number}, first shown at "
+            f"0x{first_time[group.kept]:08x}</figcaption></figure>"
+        ]
+        for member in group.members[1:1 + MEMBERS_SHOWN]:
+            figures.append(
+                f"<figure>{picture(dump.frames[member])}<figcaption>merged frame, first shown at "
+                f"0x{first_time[member]:08x}</figcaption></figure>"
+            )
+        return (
+            f'<div class="group" id="frame-{number}"><p>Frame {number}: {len(group.members)} frames '
+            f'merged, shape mode {"on" if group.shape else "off"}, varying area {area} pixels '
+            f"({share}% of the limit).</p><div class=\"row\">{''.join(figures)}</div></div>"
+        )
+
+    def section(anchor, title, numbers, extra=""):
+        numbers = sorted(numbers, key=lambda number: (-len(groups[number].members), number))
+        blocks = "".join(group_block(number) for number in numbers)
+        return f'<details id="{anchor}"><summary>{title}</summary>{extra}{blocks}</details>'
+
+    merged = [number for number, group in enumerate(groups) if len(group.members) > 1]
+    out = [
+        "<!doctype html><html><head><meta charset=\"utf-8\">",
+        f"<title>DMD mask optimizer report for {html.escape(rom_name)}</title>",
+        f"<style>{_STYLE}</style></head><body>",
+        f"<h1>DMD mask optimizer report for {html.escape(rom_name)}</h1>",
+        "<h2>Summary</h2><table>",
+    ]
+    for label, value in summarize(dump, analysis).items():
+        out.append(f"<tr><th>{label}</th><td>{value}</td></tr>")
+    options = analysis.options
+    for label, value in (
+        ("--max-vary", f"{options.max_vary:g}% ({analysis.limit} pixels)"),
+        ("--max-masks", options.max_masks),
+        ("--min-gain", options.min_gain),
+        ("--min-lit", f"{analysis.min_lit} pixels"),
+        ("shape mode", "on" if options.shape_mode else "off"),
+    ):
+        out.append(f"<tr><th>{label}</th><td>{value}</td></tr>")
+    out.append("</table><p>Dump files: " + html.escape(", ".join(dump.files)) + "</p>")
+
+    out.append("<h2>Warnings</h2>")
+    warnings = [html.escape(warning) for warning in dump.warnings]
+    for frame, kept in analysis.collisions:
+        warnings.append(
+            f"The frame first shown at 0x{first_time[frame]:08x} has the same CRC32 as kept frame "
+            f"{position[kept]} under that frame's mask and shape mode, but different pixels. "
+            "libserum cannot tell the two apart."
+        )
+    for number in np.flatnonzero(durations < SKIP_FRAME_DURATION):
+        warnings.append(
+            f"Kept frame {number} is shown for {durations[number]} ms. The editor marks frames "
+            f"under {SKIP_FRAME_DURATION} ms inactive until they are coloured."
+        )
+    if warnings:
+        out.append("<ul>" + "".join(f"<li>{warning}</li>" for warning in warnings) + "</ul>")
+    else:
+        out.append("<p>No warnings.</p>")
+
+    if not merged:
+        out.append("<h2>Merged groups</h2><p>No frames were merged.</p>")
+    else:
+        largest = sorted(merged, key=lambda number: (-varying_area(groups[number]), number))[:REVIEW_FIRST]
+        out.append(f"<h2>The {len(largest)} merged groups with the largest varying area</h2><ol>")
+        for number in largest:
+            share = 100 * varying_area(groups[number]) // analysis.limit if analysis.limit else 0
+            out.append(
+                f'<li><a href="#frame-{number}">Frame {number}</a>: {share}% of the limit, '
+                f"{len(groups[number].members)} frames merged</li>"
+            )
+        out.append("</ol><h2>Merged groups by mask</h2>")
+        for mask_number, mask in enumerate(analysis.masks):
+            numbers = [number for number in merged if groups[number].mask == mask_number]
+            frames = sum(len(groups[number].members) for number in numbers)
+            name = mask_name(mask_number, mask, analysis.mask_saved[mask_number])
+            title = (
+                f"Mask {mask_number} ({html.escape(name)}): covers {int(mask.sum())} pixels, "
+                f"{len(numbers)} groups, {frames} frames merged into {len(numbers)}"
+            )
+            shown = np.where(mask, 2 * shades, 0).astype(np.uint8)
+            out.append(section(f"mask-{mask_number}", title, numbers, picture(shown)))
+        numbers = [number for number in merged if groups[number].mask == NO_MASK]
+        if numbers:
+            frames = sum(len(groups[number].members) for number in numbers)
+            title = f"Shape mode with no mask: {len(numbers)} groups, {frames} frames merged into {len(numbers)}"
+            out.append(section("shape-only", title, numbers))
+    out.append("</body></html>")
+    return "\n".join(out)
