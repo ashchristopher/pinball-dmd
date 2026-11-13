@@ -296,3 +296,58 @@ def timeline_links(dump):
         return np.zeros((0, 2), np.int64)
     pairs = np.stack([np.minimum(first, second)[keep], np.maximum(first, second)[keep]], axis=1)
     return np.unique(pairs, axis=0)
+
+
+def candidate_regions(view, links, limit, width, height):
+    """Step A of the design for one view.
+
+    view is uint8 [frames, pixels], links comes from timeline_links, limit is in
+    pixels. Returns the candidate regions (bool [pixels] each) in discovery order.
+    """
+    if len(links) == 0:
+        return []
+    difference = np.empty(len(links), np.int64)
+    for start in range(0, len(links), 2048):
+        part = links[start:start + 2048]
+        difference[start:start + 2048] = (view[part[:, 0]] != view[part[:, 1]]).sum(axis=1)
+    order = np.lexsort((links[:, 1], links[:, 0], difference))
+    parent = list(range(len(view)))
+    varying = {}  # earliest frame of a set -> bool [pixels]; a missing entry means "no pixel"
+
+    def earliest(frame):
+        while parent[frame] != frame:
+            parent[frame] = parent[parent[frame]]
+            frame = parent[frame]
+        return frame
+
+    regions = []
+    seen = set()
+    for link in order:
+        if difference[link] > limit:
+            break
+        a = earliest(int(links[link, 0]))
+        b = earliest(int(links[link, 1]))
+        if a == b:
+            continue
+        joined = view[a] != view[b]
+        if a in varying:
+            joined |= varying[a]
+        if b in varying:
+            joined |= varying[b]
+        count = int(joined.sum())
+        if count > limit:
+            continue
+        if count:
+            region = pad_region(joined, width, height)
+            if int(region.sum()) > limit:
+                continue
+            key = region.tobytes()
+            if key not in seen:
+                seen.add(key)
+                regions.append(region)
+        low, high = min(a, b), max(a, b)
+        parent[high] = low
+        varying.pop(high, None)
+        if count:
+            varying[low] = joined
+    return regions
