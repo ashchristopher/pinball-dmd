@@ -259,3 +259,40 @@ def pad_region(pixels, width, height):
     for top, bottom, left, right in found:
         padded[top:bottom, left:right] = True
     return np.repeat(np.repeat(padded, CELL, axis=0), CELL, axis=1).reshape(-1)
+
+
+@dataclass
+class Options:
+    """The settings of a run (section 5 of the design)."""
+
+    max_vary: float = 25.0  # percent of the display that may vary inside a merged group
+    max_masks: int = 64  # mask slots the tool may use
+    min_gain: int = 5  # frames a candidate must save to be applied
+    min_lit: int | None = None  # lit pixels that must remain outside a mask; None = pixels // 128
+    shape_mode: bool = True  # allow the shape view
+
+    def limit(self, pixels):
+        """The limit of the design in pixels: floor(max_vary / 100 * pixels)."""
+        return int(self.max_vary * pixels // 100)
+
+    def lit_needed(self, pixels):
+        return pixels // 128 if self.min_lit is None else self.min_lit
+
+
+def shape_view(frames):
+    """The shape view of frames: 1 where a pixel is lit, otherwise 0."""
+    return (np.asarray(frames) > 0).astype(np.uint8)
+
+
+def timeline_links(dump):
+    """Unordered pairs of distinct frames that appear one directly after the other in a dump file.
+
+    Returns int64 [links, 2] with the lower frame number first, sorted, without duplicates.
+    """
+    first = dump.record_frame[:-1]
+    second = dump.record_frame[1:]
+    keep = (dump.record_file[:-1] == dump.record_file[1:]) & (first != second)
+    if not keep.any():
+        return np.zeros((0, 2), np.int64)
+    pairs = np.stack([np.minimum(first, second)[keep], np.maximum(first, second)[keep]], axis=1)
+    return np.unique(pairs, axis=0)
