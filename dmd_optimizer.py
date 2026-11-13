@@ -758,3 +758,34 @@ def finish(work, options):
         groups=groups,
         collisions=collisions,
     )
+
+
+def analyze(dump, options=None, progress=None):
+    """Find the groups, their settings and the masks for a dump (section 7 of the design).
+
+    progress, when given, is called with a short message at the start of each stage.
+    """
+    options = options or Options()
+    say = progress or (lambda message: None)
+    say("preparing frames")
+    work = Workspace(dump, options)
+    regions = []
+    if options.max_masks > 0 and work.limit > 0:
+        say("finding candidate regions")
+        links = timeline_links(dump)
+        seen = set()
+        for shape in (False, True) if options.shape_mode else (False,):
+            view = shape_view(dump.frames) if shape else dump.frames
+            for region in candidate_regions(view, links, work.limit, dump.width, dump.height):
+                key = region.tobytes()
+                if key not in seen:
+                    seen.add(key)
+                    regions.append(region)
+        view = None  # the shape view is as large as the frames; do not keep it
+    say(f"choosing masks from {len(regions)} candidate regions")
+    choose_masks(work, regions, options)
+    say("tightening settings")
+    tighten(work, options)
+    work.labellers.clear()  # the largest tables in memory; step E does not use them
+    say("verifying")
+    return finish(work, options)
