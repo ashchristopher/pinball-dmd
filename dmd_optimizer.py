@@ -969,3 +969,100 @@ def write_project(project, crom_path, crp_path):
         _write_fields(stream, _crom_layout(header), project.crom)
     with open(crp_path, "wb") as stream:
         _write_fields(stream, _crp_layout(header), project.crp)
+
+
+SKIP_FRAME_DURATION = 15  # ms; the editor marks shorter frames inactive until they are coloured
+
+
+_ROM_NAME = re.compile(r"[A-Za-z0-9_-]([A-Za-z0-9_.-]{0,61}[A-Za-z0-9_-])?")
+_WINDOWS_DEVICES = {"CON", "PRN", "AUX", "NUL"} | {f"{port}{n}" for port in ("COM", "LPT") for n in range(1, 10)}
+
+
+def check_rom_name(name):
+    """Raise OptimizerError unless name can be stored in a project and used as a file name on any system."""
+    if not _ROM_NAME.fullmatch(name) or name.split(".")[0].upper() in _WINDOWS_DEVICES:
+        raise OptimizerError(
+            f"ROM name {name!r} is not usable: use 1 to 63 letters, digits, '_', '-' or '.', "
+            "not starting or ending with '.', and not a Windows device name such as NUL; "
+            "--rom-name sets another name"
+        )
+
+
+def default_colours(shades):
+    """The RGB565 orange ramp ColorizingDMD gives a freshly imported frame."""
+    level = (31 * np.arange(shades)) // (shades - 1)
+    return ((level << 11) | (level << 5)).astype(np.uint16)
+
+
+def mask_name(number, mask, saved):
+    """The name stored for a mask, at most 30 bytes."""
+    percent = int(mask.sum() * 100 / mask.size + 0.5)
+    return f"auto-{number:02d} {percent}% {saved} frames"[:30]
+
+
+def kept_durations(dump, analysis):
+    """Duration of every kept frame: the longest duration of any record showing its group."""
+    longest = np.zeros(len(dump.frames), np.uint32)
+    np.maximum.at(longest, dump.record_frame, dump.record_duration)
+    return np.array([longest[group.members].max() for group in analysis.groups], np.uint32)
+
+
+def new_project(dump, analysis, rom_name):
+    """Build the project for an analysis, with every other value as after a fresh import."""
+    check_rom_name(rom_name)
+    width, height = dump.width, dump.height
+    groups = analysis.groups
+    kept = np.array([group.kept for group in groups], np.int64)
+    colours = default_colours(dump.shades)
+    durations = kept_durations(dump, analysis)
+    header = {
+        "name": rom_name.encode("ascii"),
+        "header_length": HEADER_LENGTH,
+        "fWidth": width,
+        "fHeight": height,
+        "fWidthX": width * 2 if height == 32 else width // 2,
+        "fHeightX": 64 if height == 32 else 32,
+        "nFrames": len(groups),
+        "noColors": dump.shades,
+        "nCompMasks": len(analysis.masks),
+        "nSprites": 0,
+        "nBackgrounds": 0,
+        "is256x64": 0,
+    }
+    crom = {name: 0 for name, _, _ in _crom_layout(header)}
+    crom.update(
+        HashCode=np.array([group.hash for group in groups], np.uint32),
+        ShapeCompMode=np.array([group.shape for group in groups], np.uint8),
+        CompMaskID=np.array([group.mask for group in groups], np.uint8),
+        CompMasks=analysis.masks.astype(np.uint8).reshape(-1),
+        cFrames=colours[dump.frames[kept]].reshape(-1),
+        DynaMasks=255,
+        DynaMasksX=255,
+        FrameSprites=255,
+        ActiveFrames=(durations >= SKIP_FRAME_DURATION).astype(np.uint8),
+        TriggerID=0xFFFFFFFF,
+        FrameSpriteBB=np.tile(np.array([0, 0, width - 1, height - 1], np.uint16), len(groups) * 32),
+        BackgroundID=0xFFFF,
+        BackgroundMask=1,
+        BackgroundMaskX=1,
+    )
+    names = np.zeros((64, 32), np.uint8)
+    for number, mask in enumerate(analysis.masks):
+        text = mask_name(number, mask, analysis.mask_saved[number]).encode("ascii")
+        names[number, :len(text)] = np.frombuffer(text, np.uint8)
+    palette = np.zeros(256 * 64, np.uint16)
+    palette[:dump.shades] = colours
+    edit_colours = np.zeros(16, np.uint16)
+    edit_colours[:dump.shades] = colours
+    stored_name = np.zeros(64, np.uint8)
+    stored_name[:len(header["name"])] = np.frombuffer(header["name"], np.uint8)
+    crp = {name: 0 for name, _, _ in _crp_layout(header)}
+    crp.update(
+        name=stored_name,
+        oFrames=dump.frames[kept].reshape(-1),
+        Mask_Names=names.reshape(-1),
+        FrameDuration=durations,
+        Palette=palette,
+        acEditColorsS=edit_colours,
+    )
+    return Project(header=header, crom=crom, crp=crp)
