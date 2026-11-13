@@ -653,3 +653,108 @@ def tighten(work, options):
         work.group_mask[frames] = number
         work.group_shape[frames] = shape
         pending[settled] = False
+
+
+@dataclass
+class Group:
+    """Frames merged into one kept frame."""
+
+    kept: int  # distinct frame number of the kept frame, the earliest member
+    members: np.ndarray  # distinct frame numbers in ascending order; members[0] == kept
+    mask: int  # mask number, or NO_MASK
+    shape: bool  # True when the group uses the shape view
+    varying: np.ndarray  # bool [pixels]: where the members differ in value
+    hash: int = 0  # CRC32 of the kept frame under the group's setting
+
+
+@dataclass
+class Analysis:
+    """The result of analysing a dump."""
+
+    options: Options
+    limit: int  # pixels that may vary inside a merged group
+    min_lit: int  # lit pixels required outside a mask
+    masks: np.ndarray  # bool [masks, pixels] in mask-number order
+    mask_saved: list  # frames saved by each mask
+    groups: list  # Group objects in kept-frame order
+    collisions: list  # (distinct frame, kept frame) pairs with equal CRC32 but different pixels
+
+
+def verify_groups(frames, groups, masks):
+    """Check rule R1 the way libserum identifies frames, and set every group's hash.
+
+    Returns the CRC32 collisions found. Raises OptimizerError when a frame does
+    not match exactly one kept frame, or matches the kept frame of another group.
+    """
+    defect = "internal check failed: {}. This is a defect in dmd_optimizer; no files were written."
+    own = np.empty(len(frames), np.int64)
+    by_setting = {}
+    for number, group in enumerate(groups):
+        own[group.members] = number
+        by_setting.setdefault((group.mask, group.shape), []).append(number)
+    matches = np.zeros(len(frames), np.int64)
+    collisions = []
+    for (mask_number, shape), numbers in sorted(by_setting.items()):
+        mask = None if mask_number == NO_MASK else masks[mask_number]
+        kept = np.array([groups[number].kept for number in numbers])
+        kept_rows = _compared_pixels(frames[kept], mask, shape)
+        by_hash = {}
+        for position, value in enumerate(_row_hashes(kept_rows).tolist()):
+            groups[numbers[position]].hash = value
+            by_hash.setdefault(value, []).append(position)
+        for start in range(0, len(frames), BATCH_FRAMES):  # a bounded number of frames at a time
+            rows = _compared_pixels(frames[start:start + BATCH_FRAMES], mask, shape)
+            for offset, value in enumerate(_row_hashes(rows).tolist()):
+                for position in by_hash.get(value, ()):
+                    frame, number = start + offset, numbers[position]
+                    if not np.array_equal(rows[offset], kept_rows[position]):
+                        collisions.append((frame, int(kept[position])))
+                        continue
+                    matches[frame] += 1
+                    if own[frame] != number:
+                        raise OptimizerError(
+                            defect.format(
+                                f"frame {frame} matches the kept frame {int(kept[position])} of another group"
+                            )
+                        )
+    wrong = np.flatnonzero(matches != 1)
+    if len(wrong):
+        raise OptimizerError(
+            defect.format(f"frame {int(wrong[0])} matches {int(matches[wrong[0]])} kept frames")
+        )
+    return collisions
+
+
+def finish(work, options):
+    """Step E of the design: number the masks, compute the hashes and verify the result."""
+    kept, group, sizes, order, starts, varying = _group_table(work)
+    group_masks = work.group_mask[kept]
+    used = sorted(set(group_masks[group_masks >= 0].tolist()))
+    saved = {number: int((sizes[group_masks == number] - 1).sum()) for number in used}
+    ranking = sorted(used, key=lambda number: (-saved[number], work.pool[number].area, number))
+    renumbered = {old: new for new, old in enumerate(ranking)}
+    if ranking:
+        masks = np.stack([work.pool[old].mask for old in ranking])
+    else:
+        masks = np.zeros((0, work.frames.shape[1]), bool)
+    members = np.split(order, starts[1:])
+    groups = [
+        Group(
+            kept=int(kept[number]),
+            members=members[number],
+            mask=renumbered[int(group_masks[number])] if group_masks[number] >= 0 else NO_MASK,
+            shape=bool(work.group_shape[kept[number]]),
+            varying=varying[number],
+        )
+        for number in range(len(kept))
+    ]
+    collisions = verify_groups(work.frames, groups, masks)
+    return Analysis(
+        options=options,
+        limit=work.limit,
+        min_lit=work.min_lit,
+        masks=masks,
+        mask_saved=[saved[old] for old in ranking],
+        groups=groups,
+        collisions=collisions,
+    )
