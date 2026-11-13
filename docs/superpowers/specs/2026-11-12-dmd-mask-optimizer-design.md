@@ -131,7 +131,7 @@ The file starts with inline script metadata so `uv run` installs numpy:
 | Option | Default | Meaning |
 |---|---|---|
 | `--out-dir DIR` | `<rom>-optimized` in the current folder | Where the three output files go |
-| `--rom-name NAME` | First dump's file name without extension | Name stored in the project and used for file names: 1 to 63 ASCII characters, without path or wildcard characters |
+| `--rom-name NAME` | First dump's file name without extension | Name stored in the project and used for file names; see the rule below |
 | `--max-vary PCT` | 25 | Percent of the display that may vary inside a merged group |
 | `--max-masks N` | 64 | Mask slots the tool may use (0–64) |
 | `--min-gain N` | 5 | Frames a candidate must save to be applied |
@@ -148,10 +148,14 @@ output and exits with status 0. On any error in section 11 it prints one error
 message as the last line on standard error, prints nothing to standard output, and
 exits with status 1.
 
-The ROM name is limited to ASCII because the project stores it in a single-byte
-field whose meaning for other characters depends on the Windows code page. It is
-also a file name, so it may not contain any of `/ \ : * ? " < > |` and may not be
-`.` or `..`.
+A ROM name is 1 to 63 characters, each a letter `A`-`Z` or `a`-`z`, a digit, `_`,
+`-` or `.`. It may not start or end with `.`, and the part before the first `.` may
+not be a Windows device name (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`,
+`LPT1`-`LPT9`, in any case). The reasons: the project stores the name in a
+single-byte field whose meaning for other characters depends on the Windows code
+page, and the name is also a file name that must work on Windows, where the editor
+runs. PinMAME ROM names such as `twst_405` fit this rule. When the first dump's file
+name does not fit, the error message asks for `--rom-name`.
 
 ## 6. Reading dumps
 
@@ -161,8 +165,10 @@ The reader follows ColorizingDMD's `Parse_TXT` for the supported sizes.
   in milliseconds.
 - H lines of W characters follow. `0`–`9` map to 0–9; `a`–`f` and `A`–`F` map to 10–15.
 - Records are separated by blank lines. Line endings may be CRLF or LF.
-- W and H come from the first record of the first file. They must be 128x32 or
-  192x64. Every record in every file must have the same size.
+- W is the length of the first row of the first record of the first file. It must
+  be 128 or 192, which fixes H at 32 or 64. If the first record has fewer than H rows
+  of that length, the size is reported as unsupported. Every record in every file
+  must have the same size.
 - The project has 16 shades if any pixel value in any file exceeds 3, otherwise 4.
 - Blank lines are ignored everywhere, including between the rows of a record. The
   editor ignores them too.
@@ -571,11 +577,21 @@ The tool stops with one error message, exit status 1, and no output files when:
 
 A dump whose last record is incomplete is read up to that record, with a warning.
 
-Output files are written under temporary names in the output folder and renamed
-after all three are complete. A failed run removes its temporary files. If a rename
-fails, every file that was already replaced is put back, so an existing project is
-either replaced completely or left exactly as it was. If the run created the output
-folder and nothing was written, the folder is removed.
+Output files are written into a temporary folder with a unique name inside the
+output folder and moved into place after all three are complete. The check for
+existing files is repeated just before the move.
+
+- An existing file is first moved into the temporary folder, and the new file then
+  takes its place.
+- If a move fails, every file is put back as it was, so an existing project is either
+  replaced completely or left exactly as it was.
+- If putting a file back fails as well, the temporary folder is left in place and the
+  error message lists the files to check by hand.
+- Otherwise the temporary folder is removed at the end of the run, successful or not.
+  If only that removal fails after a successful run, the tool prints a warning and
+  still exits with status 0.
+- If the run created the output folder and nothing was written, the folder is
+  removed.
 
 ## 12. Testing
 

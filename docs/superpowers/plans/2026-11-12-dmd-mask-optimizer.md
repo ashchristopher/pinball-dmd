@@ -414,8 +414,10 @@ import heapq
 import html
 import os
 import re
+import shutil
 import struct
 import sys
+import tempfile
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -453,7 +455,7 @@ Files:
 
 Design section 6. A dump is text: a timestamp line `0x` plus 8 hex digits (milliseconds), then one line of hex digits per pixel row, then a blank line. `parse_dump_text` turns the bytes of one file into an array of frames and an array of timestamps.
 
-Reading stops, with a warning, at the first record that is incomplete or holds a character other than a hex digit. If other text follows the rows of a complete record, that record is kept and reading stops after it. Blank lines are ignored everywhere, as the editor ignores them. The frame size comes from the first record and must be 128x32 or 192x64.
+Reading stops, with a warning, at the first record that is incomplete or holds a character other than a hex digit. If other text follows the rows of a complete record, that record is kept and reading stops after it. Blank lines are ignored everywhere, as the editor ignores them. The width of the first row fixes the frame size: 128 means 128x32 and 192 means 192x64. Any other width, or a first record with too few rows, is an unsupported size.
 
 The tests cover:
 
@@ -461,7 +463,7 @@ The tests cover:
 - CRLF and LF line endings
 - hex digits in lower and upper case
 - a truncated last record, a short row and a letter beyond `f` (reading stops with a warning naming the record)
-- text after a complete record (the record is kept, reading stops)
+- text after a complete record (the record is kept, reading stops), including a line exactly as wide as a pixel row after the first record
 - blank lines between the rows of a record (ignored)
 - an unsupported size, a file with no frame, and a file cut inside its first record (errors)
 
@@ -541,6 +543,15 @@ def test_text_after_a_complete_record_stops_reading_and_keeps_the_record():
     assert warning == "a.txt: unexpected text after record 1; reading stopped there"
 
 
+@pytest.mark.parametrize("extra", [b"0123" * 32, b"z" * 128])
+def test_a_row_too_many_after_the_first_record_keeps_the_record(extra):
+    # the extra line is as wide as a pixel row, so only the supported height tells where the record ends
+    first, second = (dump_text([frame]) for frame in score_frames(2))
+    parsed, times, size, warning = tool.parse_dump_text(first + extra + b"\n\n" + second, "a.txt")
+    assert size == (W, H) and len(parsed) == 1 and times.tolist() == [1000]
+    assert warning == "a.txt: unexpected text after record 1; reading stopped there"
+
+
 def test_blank_lines_inside_a_record_are_ignored():
     lines = dump_text(score_frames(3)).split(b"\n")
     lines.insert(H + 2 + 7, b"")  # a blank line between two rows of the second record
@@ -569,7 +580,7 @@ def test_a_file_cut_inside_its_first_record_is_an_error():
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `uv run --with pytest --with numpy pytest -q tests/test_dump_parse.py`
-Expected: `12 failed`, with `AttributeError: module 'dmd_optimizer' has no attribute 'parse_dump_text'`.
+Expected: `14 failed`, with `AttributeError: module 'dmd_optimizer' has no attribute 'parse_dump_text'`.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -611,15 +622,16 @@ def parse_dump_text(data, name):
             if not lines:
                 break
             width = len(lines[0])
-            height = 0
-            while height < len(lines) and len(lines[height]) == width:
-                height += 1
-            size = (width, height)
-            if size not in SUPPORTED_SIZES:
+            rows = 0
+            while rows < len(lines) and len(lines[rows]) == width:
+                rows += 1
+            height = dict(SUPPORTED_SIZES).get(width)
+            if height is None or rows < height:
                 raise OptimizerError(
-                    f"{name}: frame size {width}x{height} is not supported "
+                    f"{name}: frame size {width}x{rows} is not supported "
                     "(supported sizes are 128x32 and 192x64)"
                 )
+            size = (width, height)
         width, height = size
         rows = lines[:height]
         pixels = None
@@ -643,10 +655,10 @@ def parse_dump_text(data, name):
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `uv run --with pytest --with numpy pytest -q tests/test_dump_parse.py`
-Expected: `12 passed`.
+Expected: `14 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `14 passed`.
+Expected: `16 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -837,7 +849,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_dump_read.py`
 Expected: `7 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `21 passed`.
+Expected: `23 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -959,7 +971,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_hashing.py`
 Expected: `5 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `26 passed`.
+Expected: `28 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -1135,7 +1147,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_padding.py`
 Expected: `9 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `35 passed`.
+Expected: `37 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -1273,7 +1285,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_options_links.py`
 Expected: `5 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `40 passed`.
+Expected: `42 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -1452,7 +1464,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_candidate_regions.p
 Expected: `7 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `47 passed`.
+Expected: `49 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -1621,7 +1633,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_labeller.py`
 Expected: `4 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `51 passed`.
+Expected: `53 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -1901,7 +1913,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_workspace.py`
 Expected: `7 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `58 passed`.
+Expected: `60 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -2071,7 +2083,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_choose_masks.py`
 Expected: `8 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `66 passed`.
+Expected: `68 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -2259,7 +2271,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_tighten.py`
 Expected: `6 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `72 passed`.
+Expected: `74 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -2510,7 +2522,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_finish.py`
 Expected: `8 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `80 passed`.
+Expected: `82 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -2837,7 +2849,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_analyze.py tests/te
 Expected: `22 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `102 passed`.
+Expected: `104 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -3198,7 +3210,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_project_files.py`
 Expected: `8 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `110 passed`.
+Expected: `112 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -3220,6 +3232,8 @@ Files:
 Design sections 8.2 (last column), 8.3 and 8.4. `new_project` fills the identification fields from the analysis and gives every other field the value ColorizingDMD gives it on a fresh import: colourised frames in the default orange ramp, no dynamic masks, no sprites, no backgrounds.
 
 The duration of a kept frame is the longest duration of any record that shows a member of its group. A kept frame shorter than 15 ms is marked inactive, as the editor does.
+
+`check_rom_name` enforces the ROM name rule of design section 5: 1 to 63 letters, digits, `_`, `-` or `.`, not starting or ending with `.`, and not a Windows device name. The name is stored in a single-byte field and is also used as a file name on Windows.
 
 The tests cover:
 
@@ -3345,7 +3359,10 @@ def test_192x64_with_sixteen_shades(tmp_path):
     assert (tmp_path / "demo.cROM").stat().st_size == 106 + per_frame
 
 
-@pytest.mark.parametrize("name", ["", "a" * 64, "caf\u00e9", "a/b", "a\\b", "..", "x:y", "what?"])
+@pytest.mark.parametrize("name", [
+    "", "a" * 64, "caf\u00e9", "a/b", "a\\b", "..", ".", "x:y", "what?", "a b", "rom.", ".rom",
+    "nul", "COM1", "lpt9.old", "a\x00b", "a\nb", "a\rb", "tab\there",
+])
 def test_unusable_rom_names_are_refused(tmp_path, name):
     with pytest.raises(tool.OptimizerError, match="is not usable"):
         tool.check_rom_name(name)
@@ -3355,14 +3372,14 @@ def test_unusable_rom_names_are_refused(tmp_path, name):
 
 
 def test_usable_rom_names_are_accepted():
-    for name in ("twst_405", "a" * 63, "afm_113b", "my rom-1.2"):
+    for name in ("twst_405", "a" * 63, "afm_113b", "My-ROM_1.2", "x", "com10", "null"):
         tool.check_rom_name(name)
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `uv run --with pytest --with numpy pytest -q tests/test_new_project.py`
-Expected: `16 failed`, with `AttributeError: module 'dmd_optimizer' has no attribute 'check_rom_name'`.
+Expected: `27 failed`, with `AttributeError: module 'dmd_optimizer' has no attribute 'check_rom_name'`.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -3372,16 +3389,17 @@ Append to `dmd_optimizer.py`:
 SKIP_FRAME_DURATION = 15  # ms; the editor marks shorter frames inactive until they are coloured
 
 
+_ROM_NAME = re.compile(r"[A-Za-z0-9_-]([A-Za-z0-9_.-]{0,61}[A-Za-z0-9_-])?")
+_WINDOWS_DEVICES = {"CON", "PRN", "AUX", "NUL"} | {f"{port}{n}" for port in ("COM", "LPT") for n in range(1, 10)}
+
+
 def check_rom_name(name):
-    """Raise OptimizerError unless name can be stored in a project and used as a file name."""
-    try:
-        encoded = name.encode("ascii")
-    except UnicodeEncodeError:
-        encoded = b""
-    if not 0 < len(encoded) <= 63 or any(char in name for char in '/\\:*?"<>|') or name in (".", ".."):
+    """Raise OptimizerError unless name can be stored in a project and used as a file name on any system."""
+    if not _ROM_NAME.fullmatch(name) or name.split(".")[0].upper() in _WINDOWS_DEVICES:
         raise OptimizerError(
-            f"ROM name {name!r} is not usable: it must be 1 to 63 ASCII characters "
-            "without path or wildcard characters"
+            f"ROM name {name!r} is not usable: use 1 to 63 letters, digits, '_', '-' or '.', "
+            "not starting or ending with '.', and not a Windows device name such as NUL; "
+            "--rom-name sets another name"
         )
 
 
@@ -3468,10 +3486,10 @@ def new_project(dump, analysis, rom_name):
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `uv run --with pytest --with numpy pytest -q tests/test_new_project.py`
-Expected: `16 passed`.
+Expected: `27 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `126 passed`.
+Expected: `139 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -3846,7 +3864,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_report.py`
 Expected: `10 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `136 passed`.
+Expected: `149 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -3867,7 +3885,9 @@ Files:
 
 Design sections 5 and 11. `main` parses the arguments, calls `run` and turns an `OptimizerError` into one line on standard error and exit status 1.
 
-`run` refuses to overwrite existing output files unless `--force` is given, and it checks that before any work is done. Files are written under `.tmp` names and moved into place by `install_files` only when all three are complete. If a move fails, `install_files` puts every file it already replaced back, so an existing project is either replaced completely or left exactly as it was. If anything fails, the temporary files are removed, and so is the output folder if this run created it and it is empty.
+`run` refuses to overwrite existing output files unless `--force` is given. It checks that before any work is done and once more just before the files are moved into place.
+
+The three files are written into a temporary folder with a unique name inside the output folder. `install_files` then moves them onto their final names. An existing file is first moved into the temporary folder. If a move fails, `install_files` puts everything back, so an existing project is either replaced completely or left exactly as it was. If putting back fails as well, it raises `InstallError` naming the files to check by hand, and the temporary folder is kept because it holds the previous versions. In every other case the temporary folder is removed at the end, and so is the output folder if this run created it and it is empty.
 
 Progress lines and warnings go to standard error while the tool works. A failed run prints exactly one line starting with `dmd_optimizer: error: `, as the last line on standard error, and nothing on standard output.
 
@@ -3886,7 +3906,10 @@ The tests cover:
 - a failed run leaves nothing behind, and leaves an existing folder as it was
 - a path that cannot be written
 - a move that fails at any of its steps leaves a new folder empty and restores existing files exactly
-- `--force` replaces all three files and leaves no extra files
+- a failure while putting files back keeps the previous version and names it in the error message
+- a temporary folder that cannot be removed is only a warning
+- a file that appears during the run is not overwritten
+- `--force` replaces all three files, leaves no extra files and does not touch other files of the user
 - every failed run prints exactly one error line, last on standard error
 - two runs give byte-identical files (rule R7)
 - `--help` lists every option
@@ -4045,18 +4068,29 @@ def test_write_problems_are_reported(dump_path, tmp_path, capsys):
     assert blocker.read_text() == "a file where the output folder should be"
 
 
-def failing_replace(monkeypatch, fail_at):
-    """Make the fail_at-th call of os.replace inside the tool raise, once."""
+def failing_replace(monkeypatch, *fail_at):
+    """Make the given calls (1 = first) of os.replace inside the tool raise."""
     real = tool.os.replace
     calls = []
 
     def replace(source, target):
         calls.append((source, target))
-        if len(calls) == fail_at:
+        if len(calls) in fail_at:
             raise OSError("simulated failure")
         return real(source, target)
 
     monkeypatch.setattr(tool.os, "replace", replace)
+
+
+OUTPUTS = ("demo_rom.cROM", "demo_rom.cRP", "demo_rom-report.html")
+
+
+def existing_outputs(folder):
+    folder.mkdir()
+    old = {name: f"old {name}".encode() for name in OUTPUTS}
+    for name, content in old.items():
+        (folder / name).write_bytes(content)
+    return old
 
 
 @pytest.mark.parametrize("fail_at", [1, 2, 3])
@@ -4071,10 +4105,7 @@ def test_a_failed_move_into_a_new_folder_leaves_nothing(dump_path, tmp_path, cap
 @pytest.mark.parametrize("fail_at", [1, 2, 3, 4, 5, 6])
 def test_a_failed_move_restores_the_existing_files(dump_path, tmp_path, capsys, monkeypatch, fail_at):
     out = tmp_path / "out"
-    out.mkdir()
-    old = {name: f"old {name}".encode() for name in ("demo_rom.cROM", "demo_rom.cRP", "demo_rom-report.html")}
-    for name, content in old.items():
-        (out / name).write_bytes(content)
+    old = existing_outputs(out)
     failing_replace(monkeypatch, fail_at)  # with --force every file takes two moves: set aside, then install
     assert tool.main([str(dump_path), "--out-dir", str(out), "--force"]) == 1
     assert error_message(capsys.readouterr()) == "cannot write the output files: simulated failure"
@@ -4083,14 +4114,73 @@ def test_a_failed_move_restores_the_existing_files(dump_path, tmp_path, capsys, 
         assert (out / name).read_bytes() == content, name
 
 
+def test_when_putting_back_fails_too_the_previous_version_is_kept_and_named(dump_path, tmp_path, capsys, monkeypatch):
+    out = tmp_path / "out"
+    old = existing_outputs(out)
+    # move 4 installs the second file and fails; move 5 would put its previous version back and fails too
+    failing_replace(monkeypatch, 4, 5)
+    assert tool.main([str(dump_path), "--out-dir", str(out), "--force"]) == 1
+    message = error_message(capsys.readouterr())
+    (staging,) = [path for path in out.iterdir() if path.is_dir()]
+    kept = staging / "demo_rom.cRP.previous"
+    assert message == ("cannot write the output files: simulated failure. Putting the previous state back "
+                       f"failed as well; check these files by hand: {kept}")
+    assert kept.read_bytes() == old["demo_rom.cRP"]
+    assert not (out / "demo_rom.cRP").exists()
+    assert (out / "demo_rom.cROM").read_bytes() == old["demo_rom.cROM"]  # put back
+    assert (out / "demo_rom-report.html").read_bytes() == old["demo_rom-report.html"]  # never touched
+
+
+def test_a_new_file_that_cannot_be_removed_again_is_named(dump_path, tmp_path, capsys, monkeypatch):
+    failing_replace(monkeypatch, 2)  # the first file is installed, the second fails
+
+    def remove(path):
+        raise OSError("simulated failure")
+
+    monkeypatch.setattr(tool.os, "remove", remove)
+    out = tmp_path / "out"
+    assert tool.main([str(dump_path), "--out-dir", str(out)]) == 1
+    message = error_message(capsys.readouterr())
+    assert message.endswith(f"check these files by hand: {out / 'demo_rom.cROM'}")
+    assert (out / "demo_rom.cROM").exists()
+
+
+def test_a_temporary_folder_that_cannot_be_removed_is_only_a_warning(dump_path, tmp_path, capsys, monkeypatch):
+    def rmtree(path):
+        raise OSError("simulated failure")
+
+    monkeypatch.setattr(tool.shutil, "rmtree", rmtree)
+    out = tmp_path / "out"
+    old = existing_outputs(out)
+    assert tool.main([str(dump_path), "--out-dir", str(out), "--force"]) == 0
+    captured = capsys.readouterr()
+    assert "dmd_optimizer: warning: could not remove the temporary folder" in captured.err
+    assert "error" not in captured.err
+    assert all((out / name).read_bytes() != old[name] for name in OUTPUTS)  # the new files are in place
+
+
 def test_force_replaces_all_three_files_and_leaves_no_extra_files(dump_path, tmp_path):
     out = tmp_path / "out"
-    out.mkdir()
-    for name in ("demo_rom.cROM", "demo_rom.cRP", "demo_rom-report.html"):
-        (out / name).write_bytes(b"old")
+    old = existing_outputs(out)
+    (out / "demo_rom.cROM.old").write_bytes(b"a file of the user")
     assert tool.main([str(dump_path), "--out-dir", str(out), "--force"]) == 0
-    assert files_in(out) == ["demo_rom-report.html", "demo_rom.cROM", "demo_rom.cRP"]
-    assert all((out / name).read_bytes() != b"old" for name in files_in(out))
+    assert files_in(out) == ["demo_rom-report.html", "demo_rom.cROM", "demo_rom.cROM.old", "demo_rom.cRP"]
+    assert all((out / name).read_bytes() != old[name] for name in OUTPUTS)
+    assert (out / "demo_rom.cROM.old").read_bytes() == b"a file of the user"
+
+
+def test_a_file_that_appears_during_the_run_is_not_overwritten(dump_path, tmp_path, capsys, monkeypatch):
+    out = tmp_path / "out"
+    real = tool.report_html
+
+    def report_and_intruder(*arguments):
+        (out / "demo_rom.cRP").write_bytes(b"appeared meanwhile")
+        return real(*arguments)
+
+    monkeypatch.setattr(tool, "report_html", report_and_intruder)
+    assert tool.main([str(dump_path), "--out-dir", str(out)]) == 1
+    assert error_message(capsys.readouterr()).endswith("demo_rom.cRP already exists; pass --force to overwrite it")
+    assert files_in(out) == ["demo_rom.cRP"] and (out / "demo_rom.cRP").read_bytes() == b"appeared meanwhile"
 
 
 def test_two_runs_give_identical_files(dump_path, tmp_path):
@@ -4113,7 +4203,7 @@ def test_help_lists_every_option(capsys):
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `uv run --with pytest --with numpy pytest -q tests/test_cli.py`
-Expected: `28 failed`, with `AttributeError: module 'dmd_optimizer' has no attribute 'main'`.
+Expected: `32 failed`, with `AttributeError: module 'dmd_optimizer' has no attribute 'main'`.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -4147,27 +4237,42 @@ def build_parser():
     return parser
 
 
-def install_files(temporary, targets):
-    """Move the finished files into place. If a move fails, put every target back as it was."""
-    moved = []  # (target, where its previous version was set aside or None)
+class InstallError(OptimizerError):
+    """Moving the output files into place failed and not everything could be put back."""
+
+
+def install_files(staged, targets, staging):
+    """Move the staged files onto the targets.
+
+    A target that exists is first moved into the staging folder. If any move
+    fails, every target is put back as it was and the OSError is raised again.
+    If putting back fails too, InstallError names the files to check by hand.
+    """
+    moved = []  # (target, its previous version inside the staging folder or None)
     try:
-        for source, target in zip(temporary, targets):
+        for source, target in zip(staged, targets):
             previous = None
             if target.exists():
-                previous = target.with_name(target.name + ".old")
+                previous = staging / (target.name + ".previous")
                 os.replace(target, previous)
             moved.append((target, previous))
             os.replace(source, target)
-    except OSError:
+    except OSError as error:
+        stranded = []
         for target, previous in reversed(moved):
-            if previous is None:
-                target.unlink(missing_ok=True)
-            else:
-                os.replace(previous, target)
+            try:
+                if previous is not None:
+                    os.replace(previous, target)
+                elif target.exists():
+                    os.remove(target)
+            except OSError:
+                stranded.append(str(target if previous is None else previous))
+        if stranded:
+            raise InstallError(
+                f"cannot write the output files: {error}. Putting the previous state back failed "
+                f"as well; check these files by hand: {', '.join(stranded)}"
+            ) from None
         raise
-    for _, previous in moved:
-        if previous is not None:
-            previous.unlink()
 
 
 def run(args):
@@ -4184,14 +4289,17 @@ def run(args):
     check_rom_name(rom_name)
     out_dir = Path(args.out_dir) if args.out_dir else Path(f"{rom_name}-optimized")
     targets = [out_dir / f"{rom_name}.cROM", out_dir / f"{rom_name}.cRP", out_dir / f"{rom_name}-report.html"]
-    if not args.force:
-        for target in targets:
-            if target.exists():
-                raise OptimizerError(f"{target} already exists; pass --force to overwrite it")
+
+    def refuse_to_overwrite():
+        if not args.force:
+            for target in targets:
+                if target.exists():
+                    raise OptimizerError(f"{target} already exists; pass --force to overwrite it")
 
     def say(message):
         print(f"dmd_optimizer: {message}", file=sys.stderr)
 
+    refuse_to_overwrite()
     say("reading dumps")
     dump = read_dumps(args.dumps)
     for warning in dump.warnings:
@@ -4206,26 +4314,32 @@ def run(args):
     analysis = analyze(dump, options, say)
     project = new_project(dump, analysis, rom_name)
     created = not out_dir.exists()
-    temporary = [target.with_name(target.name + ".tmp") for target in targets]
+    staging = None
+    keep_staging = False
     done = False
     try:
         say("writing files")
         out_dir.mkdir(parents=True, exist_ok=True)
-        write_project(project, temporary[0], temporary[1])
-        temporary[2].write_text(report_html(dump, analysis, rom_name), encoding="utf-8")
-        install_files(temporary, targets)
+        staging = Path(tempfile.mkdtemp(prefix=".dmd_optimizer-", dir=out_dir))
+        staged = [staging / target.name for target in targets]
+        write_project(project, staged[0], staged[1])
+        staged[2].write_text(report_html(dump, analysis, rom_name), encoding="utf-8")
+        refuse_to_overwrite()  # a target may have appeared while the tool was working
+        install_files(staged, targets, staging)
         done = True
+    except InstallError:
+        keep_staging = True  # it holds previous versions that could not be put back
+        raise
     except OSError as error:
         raise OptimizerError(f"cannot write the output files: {error}") from None
     finally:
-        if not done:
-            for path in temporary:
-                try:
-                    path.unlink(missing_ok=True)
-                except OSError:
-                    pass  # the folder itself could not be created
-            if created and out_dir.is_dir() and not any(out_dir.iterdir()):
-                out_dir.rmdir()
+        if staging is not None and not keep_staging:
+            try:
+                shutil.rmtree(staging)
+            except OSError as error:
+                say(f"warning: could not remove the temporary folder {staging}: {error}")
+        if not done and created and out_dir.is_dir() and not any(out_dir.iterdir()):
+            out_dir.rmdir()
     for label, value in summarize(dump, analysis).items():
         print(f"{label}: {value}")
     for target in targets:
@@ -4249,10 +4363,10 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `uv run --with pytest --with numpy pytest -q tests/test_cli.py`
-Expected: `28 passed`.
+Expected: `32 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `164 passed`.
+Expected: `181 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -4467,7 +4581,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_tools.py`
 Expected: `4 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `168 passed`.
+Expected: `185 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -4724,7 +4838,7 @@ The numbers 4116, 43 and 196 of 7682 are exact for this dump. If they differ, or
 - [ ] **Step 6: Run the fast tests**
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `168 passed`, with 6 deselected.
+Expected: `185 passed`, with 6 deselected.
 
 - [ ] **Step 7: Commit**
 
@@ -4992,7 +5106,7 @@ If the library reports a problem, the assertion shows a list of `(record, kind, 
 - [ ] **Step 5: Run the fast tests**
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `168 passed`, with 8 deselected.
+Expected: `185 passed`, with 8 deselected.
 
 - [ ] **Step 6: Commit**
 
@@ -5089,10 +5203,10 @@ This prints every header value and field that differs between two projects.
 - [ ] **Step 2: Run every test**
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `168 passed`, with 8 deselected.
+Expected: `185 passed`, with 8 deselected.
 
 Run: `uv run --with pytest --with numpy pytest -q -s -m "twister or libserum"`
-Expected: `8 passed`, with 168 deselected. This takes two to three minutes.
+Expected: `8 passed`, with 185 deselected. This takes two to three minutes.
 
 - [ ] **Step 3: Run the tool on the Twister dump**
 
@@ -5150,7 +5264,7 @@ Differences in `cRP TimeElapsed` and in the editor interface state fields listed
 
 The work is complete when:
 
-- `uv run --with pytest --with numpy pytest -q` prints `168 passed`;
+- `uv run --with pytest --with numpy pytest -q` prints `185 passed`;
 - `uv run --with pytest --with numpy pytest -q -s -m "twister or libserum"` prints `8 passed`;
 - the two hand-offs of Tasks 20 and 22 have been given to the user.
 
