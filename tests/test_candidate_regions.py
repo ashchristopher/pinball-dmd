@@ -54,6 +54,17 @@ def test_a_set_is_not_joined_when_the_union_would_exceed_the_limit():
     assert all((region & changed_by_wide).sum() < changed_by_wide.sum() for region in regions)
 
 
+def test_a_set_is_not_joined_when_only_the_padded_union_exceeds_the_limit():
+    base = artwork()
+    sparse = base.copy()
+    sparse[4:29:4, 10:119:4] = 3  # 196 scattered pixels that form one block of 112 x 28 pixels when padded
+    view, regions = regions_of([base, sparse])
+    changed = view[0] != view[1]
+    assert 0 < int(changed.sum()) <= LIMIT
+    assert int(tool.pad_region(changed, W, H).sum()) == 112 * 28 > LIMIT
+    assert regions == []
+
+
 def test_smallest_difference_is_processed_first():
     base = artwork()
     small = base.copy()
