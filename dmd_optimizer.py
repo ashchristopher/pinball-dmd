@@ -204,3 +204,58 @@ def frame_hashes(frames, mask=None, shape=False):
     """frame_hash of every row of frames [n, pixels], as uint32 [n]."""
     rows = _compared_pixels(frames, mask, shape)
     return np.fromiter((zlib.crc32(row) for row in rows), np.uint32, len(rows))
+
+
+CELL = 2  # masks are aligned to cells of CELL x CELL pixels
+
+
+def _segments(occupied):
+    """Runs of an occupancy vector, cut where two or more consecutive entries are empty."""
+    index = np.flatnonzero(occupied)
+    breaks = np.flatnonzero(np.diff(index) > 2)
+    starts = np.concatenate(([index[0]], index[breaks + 1]))
+    ends = np.concatenate((index[breaks], [index[-1]])) + 1
+    return list(zip(starts.tolist(), ends.tolist()))
+
+
+def _blocks(cells, top, bottom, left, right, found):
+    """Append to found the bounding boxes (top, bottom, left, right) of the blocks of cells."""
+    part = cells[top:bottom, left:right]
+    rows = np.flatnonzero(part.any(axis=1))
+    if rows.size == 0:
+        return
+    columns = np.flatnonzero(part.any(axis=0))
+    top, bottom = top + int(rows[0]), top + int(rows[-1]) + 1
+    left, right = left + int(columns[0]), left + int(columns[-1]) + 1
+    part = cells[top:bottom, left:right]
+    pieces = _segments(part.any(axis=0))
+    if len(pieces) > 1:
+        for start, end in pieces:
+            _blocks(cells, top, bottom, left + start, left + end, found)
+        return
+    pieces = _segments(part.any(axis=1))
+    if len(pieces) > 1:
+        for start, end in pieces:
+            _blocks(cells, top + start, top + end, left, right, found)
+        return
+    found.append((top, bottom, left, right))
+
+
+def pad_region(pixels, width, height):
+    """pad(V) of the design: a set of pixels padded into rectangles on the 2-pixel grid.
+
+    pixels is bool [width * height]; the result has the same shape.
+    """
+    selected = np.asarray(pixels, bool).reshape(height, width)
+    grown = selected.copy()
+    grown[1:] |= selected[:-1]
+    grown[:-1] |= selected[1:]
+    grown[:, 1:] |= selected[:, :-1]
+    grown[:, :-1] |= selected[:, 1:]
+    cells = grown.reshape(height // CELL, CELL, width // CELL, CELL).any(axis=(1, 3))
+    found = []
+    _blocks(cells, 0, cells.shape[0], 0, cells.shape[1], found)
+    padded = np.zeros_like(cells)
+    for top, bottom, left, right in found:
+        padded[top:bottom, left:right] = True
+    return np.repeat(np.repeat(padded, CELL, axis=0), CELL, axis=1).reshape(-1)
