@@ -578,20 +578,23 @@ The tool stops with one error message, exit status 1, and no output files when:
 A dump whose last record is incomplete is read up to that record, with a warning.
 
 Output files are written into a temporary folder with a unique name inside the
-output folder and moved into place after all three are complete. The check for
-existing files is repeated just before the move.
+output folder and moved into place after all three are complete.
 
-- An existing file is first moved into the temporary folder, and the new file then
-  takes its place.
-- If a move fails, every file is put back as it was, so an existing project is either
-  replaced completely or left exactly as it was.
+- Without `--force`, each output file name is claimed just before the move by
+  creating the file exclusively. That fails if the file exists, so a file that
+  appeared while the tool was working is never overwritten.
+- With `--force`, an existing file is first moved into the temporary folder, and the
+  new file then takes its place.
+- If a step of the move fails, every file is put back as it was, so an existing
+  project is either replaced completely or left exactly as it was.
 - If putting a file back fails as well, the temporary folder is left in place and the
   error message lists the files to check by hand.
 - Otherwise the temporary folder is removed at the end of the run, successful or not.
   If only that removal fails after a successful run, the tool prints a warning and
   still exits with status 0.
 - If the run created the output folder and nothing was written, the folder is
-  removed.
+  removed. If that removal fails, the tool prints a warning; the error message is
+  still the last line on standard error.
 
 ## 12. Testing
 

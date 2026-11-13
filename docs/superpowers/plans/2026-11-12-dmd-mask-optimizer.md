@@ -3885,9 +3885,16 @@ Files:
 
 Design sections 5 and 11. `main` parses the arguments, calls `run` and turns an `OptimizerError` into one line on standard error and exit status 1.
 
-`run` refuses to overwrite existing output files unless `--force` is given. It checks that before any work is done and once more just before the files are moved into place.
+`run` refuses to overwrite existing output files unless `--force` is given, and it checks that before any work is done.
 
-The three files are written into a temporary folder with a unique name inside the output folder. `install_files` then moves them onto their final names. An existing file is first moved into the temporary folder. If a move fails, `install_files` puts everything back, so an existing project is either replaced completely or left exactly as it was. If putting back fails as well, it raises `InstallError` naming the files to check by hand, and the temporary folder is kept because it holds the previous versions. In every other case the temporary folder is removed at the end, and so is the output folder if this run created it and it is empty.
+The three files are written into a temporary folder with a unique name inside the output folder. `install_files` then moves them onto their final names:
+
+- Without `--force` it first claims each name by creating the file exclusively (`open(target, "xb")`), which fails if the file exists. A file that appeared while the tool was working is therefore never overwritten.
+- With `--force` it first moves an existing file into the temporary folder.
+- If a step fails, it puts everything back, so an existing project is either replaced completely or left exactly as it was.
+- If putting back fails as well, it raises `InstallError` naming the files to check by hand, and the temporary folder is kept because it holds the previous versions.
+
+In every other case the temporary folder is removed at the end, and so is the output folder if this run created it and it is empty. A failure of either removal is a warning, never a second error.
 
 Progress lines and warnings go to standard error while the tool works. A failed run prints exactly one line starting with `dmd_optimizer: error: `, as the last line on standard error, and nothing on standard output.
 
@@ -3908,7 +3915,8 @@ The tests cover:
 - a move that fails at any of its steps leaves a new folder empty and restores existing files exactly
 - a failure while putting files back keeps the previous version and names it in the error message
 - a temporary folder that cannot be removed is only a warning
-- a file that appears during the run is not overwritten
+- a file that appears during the run, or while the files are being moved, is not overwritten
+- a failing removal of the empty output folder is a warning and keeps the error message last
 - `--force` replaces all three files, leaves no extra files and does not touch other files of the user
 - every failed run prints exactly one error line, last on standard error
 - two runs give byte-identical files (rule R7)
@@ -4132,7 +4140,7 @@ def test_when_putting_back_fails_too_the_previous_version_is_kept_and_named(dump
 
 
 def test_a_new_file_that_cannot_be_removed_again_is_named(dump_path, tmp_path, capsys, monkeypatch):
-    failing_replace(monkeypatch, 2)  # the first file is installed, the second fails
+    failing_replace(monkeypatch, 2)  # the first file is installed, the second is claimed but its move fails
 
     def remove(path):
         raise OSError("simulated failure")
@@ -4141,8 +4149,8 @@ def test_a_new_file_that_cannot_be_removed_again_is_named(dump_path, tmp_path, c
     out = tmp_path / "out"
     assert tool.main([str(dump_path), "--out-dir", str(out)]) == 1
     message = error_message(capsys.readouterr())
-    assert message.endswith(f"check these files by hand: {out / 'demo_rom.cROM'}")
-    assert (out / "demo_rom.cROM").exists()
+    assert message.endswith(f"check these files by hand: {out / 'demo_rom.cRP'}, {out / 'demo_rom.cROM'}")
+    assert (out / "demo_rom.cROM").exists() and (out / "demo_rom.cRP").read_bytes() == b""
 
 
 def test_a_temporary_folder_that_cannot_be_removed_is_only_a_warning(dump_path, tmp_path, capsys, monkeypatch):
@@ -4167,6 +4175,43 @@ def test_force_replaces_all_three_files_and_leaves_no_extra_files(dump_path, tmp
     assert files_in(out) == ["demo_rom-report.html", "demo_rom.cROM", "demo_rom.cROM.old", "demo_rom.cRP"]
     assert all((out / name).read_bytes() != old[name] for name in OUTPUTS)
     assert (out / "demo_rom.cROM.old").read_bytes() == b"a file of the user"
+
+
+def test_a_file_that_appears_while_the_files_are_moved_is_not_overwritten(dump_path, tmp_path, capsys, monkeypatch):
+    out = tmp_path / "out"
+    real = tool.os.replace
+
+    def replace_and_intruder(source, target):
+        if not (out / "demo_rom.cRP").exists():
+            (out / "demo_rom.cRP").write_bytes(b"appeared meanwhile")  # just before the first file is installed
+        return real(source, target)
+
+    monkeypatch.setattr(tool.os, "replace", replace_and_intruder)
+    assert tool.main([str(dump_path), "--out-dir", str(out)]) == 1
+    assert error_message(capsys.readouterr()) == f"{out / 'demo_rom.cRP'} already exists; pass --force to overwrite it"
+    assert files_in(out) == ["demo_rom.cRP"] and (out / "demo_rom.cRP").read_bytes() == b"appeared meanwhile"
+
+
+@pytest.mark.parametrize("function", ["listdir", "rmdir"])
+def test_a_failing_removal_of_the_empty_folder_keeps_the_error_message(dump_path, tmp_path, capsys, monkeypatch, function):
+    out = tmp_path / "out"
+    real = getattr(tool.os, function)
+
+    def failing(path, *arguments, **keywords):
+        if path == out:
+            raise PermissionError("simulated failure")
+        return real(path, *arguments, **keywords)
+
+    def broken(*arguments):
+        raise tool.OptimizerError("internal check failed: test")
+
+    monkeypatch.setattr(tool.os, function, failing)
+    monkeypatch.setattr(tool, "report_html", broken)
+    assert tool.main([str(dump_path), "--out-dir", str(out)]) == 1
+    captured = capsys.readouterr()
+    assert error_message(captured) == "internal check failed: test"
+    assert f"dmd_optimizer: warning: could not remove the empty folder {out}: simulated failure" in captured.err
+    assert files_in(out) == []
 
 
 def test_a_file_that_appears_during_the_run_is_not_overwritten(dump_path, tmp_path, capsys, monkeypatch):
@@ -4203,7 +4248,7 @@ def test_help_lists_every_option(capsys):
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `uv run --with pytest --with numpy pytest -q tests/test_cli.py`
-Expected: `32 failed`, with `AttributeError: module 'dmd_optimizer' has no attribute 'main'`.
+Expected: `35 failed`, with `AttributeError: module 'dmd_optimizer' has no attribute 'main'`.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -4241,18 +4286,22 @@ class InstallError(OptimizerError):
     """Moving the output files into place failed and not everything could be put back."""
 
 
-def install_files(staged, targets, staging):
+def install_files(staged, targets, staging, force):
     """Move the staged files onto the targets.
 
-    A target that exists is first moved into the staging folder. If any move
-    fails, every target is put back as it was and the OSError is raised again.
-    If putting back fails too, InstallError names the files to check by hand.
+    With force, a target that exists is first moved into the staging folder.
+    Without force, each target name is claimed by creating the file exclusively,
+    which fails if the file exists, so nothing can be overwritten by accident.
+    If any step fails, every target is put back as it was and OptimizerError is
+    raised. If putting back fails too, InstallError names the files to check by hand.
     """
     moved = []  # (target, its previous version inside the staging folder or None)
     try:
         for source, target in zip(staged, targets):
             previous = None
-            if target.exists():
+            if not force:
+                open(target, "xb").close()
+            elif target.exists():
                 previous = staging / (target.name + ".previous")
                 os.replace(target, previous)
             moved.append((target, previous))
@@ -4267,12 +4316,16 @@ def install_files(staged, targets, staging):
                     os.remove(target)
             except OSError:
                 stranded.append(str(target if previous is None else previous))
+        if isinstance(error, FileExistsError):
+            reason = f"{error.filename} already exists; pass --force to overwrite it"
+        else:
+            reason = f"cannot write the output files: {error}"
         if stranded:
             raise InstallError(
-                f"cannot write the output files: {error}. Putting the previous state back failed "
-                f"as well; check these files by hand: {', '.join(stranded)}"
+                f"{reason}. Putting the previous state back failed as well; "
+                f"check these files by hand: {', '.join(stranded)}"
             ) from None
-        raise
+        raise OptimizerError(reason) from None
 
 
 def run(args):
@@ -4290,16 +4343,14 @@ def run(args):
     out_dir = Path(args.out_dir) if args.out_dir else Path(f"{rom_name}-optimized")
     targets = [out_dir / f"{rom_name}.cROM", out_dir / f"{rom_name}.cRP", out_dir / f"{rom_name}-report.html"]
 
-    def refuse_to_overwrite():
-        if not args.force:
-            for target in targets:
-                if target.exists():
-                    raise OptimizerError(f"{target} already exists; pass --force to overwrite it")
+    if not args.force:
+        for target in targets:
+            if target.exists():
+                raise OptimizerError(f"{target} already exists; pass --force to overwrite it")
 
     def say(message):
         print(f"dmd_optimizer: {message}", file=sys.stderr)
 
-    refuse_to_overwrite()
     say("reading dumps")
     dump = read_dumps(args.dumps)
     for warning in dump.warnings:
@@ -4324,8 +4375,7 @@ def run(args):
         staged = [staging / target.name for target in targets]
         write_project(project, staged[0], staged[1])
         staged[2].write_text(report_html(dump, analysis, rom_name), encoding="utf-8")
-        refuse_to_overwrite()  # a target may have appeared while the tool was working
-        install_files(staged, targets, staging)
+        install_files(staged, targets, staging, args.force)
         done = True
     except InstallError:
         keep_staging = True  # it holds previous versions that could not be put back
@@ -4338,8 +4388,14 @@ def run(args):
                 shutil.rmtree(staging)
             except OSError as error:
                 say(f"warning: could not remove the temporary folder {staging}: {error}")
-        if not done and created and out_dir.is_dir() and not any(out_dir.iterdir()):
-            out_dir.rmdir()
+        if created and not done:
+            try:
+                if not os.listdir(out_dir):
+                    os.rmdir(out_dir)
+            except FileNotFoundError:
+                pass  # the folder was never created
+            except OSError as error:
+                say(f"warning: could not remove the empty folder {out_dir}: {error}")
     for label, value in summarize(dump, analysis).items():
         print(f"{label}: {value}")
     for target in targets:
@@ -4363,10 +4419,10 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `uv run --with pytest --with numpy pytest -q tests/test_cli.py`
-Expected: `32 passed`.
+Expected: `35 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `181 passed`.
+Expected: `184 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -4581,7 +4637,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_tools.py`
 Expected: `4 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `185 passed`.
+Expected: `188 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -4838,7 +4894,7 @@ The numbers 4116, 43 and 196 of 7682 are exact for this dump. If they differ, or
 - [ ] **Step 6: Run the fast tests**
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `185 passed`, with 6 deselected.
+Expected: `188 passed`, with 6 deselected.
 
 - [ ] **Step 7: Commit**
 
@@ -5106,7 +5162,7 @@ If the library reports a problem, the assertion shows a list of `(record, kind, 
 - [ ] **Step 5: Run the fast tests**
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `185 passed`, with 8 deselected.
+Expected: `188 passed`, with 8 deselected.
 
 - [ ] **Step 6: Commit**
 
@@ -5203,10 +5259,10 @@ This prints every header value and field that differs between two projects.
 - [ ] **Step 2: Run every test**
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `185 passed`, with 8 deselected.
+Expected: `188 passed`, with 8 deselected.
 
 Run: `uv run --with pytest --with numpy pytest -q -s -m "twister or libserum"`
-Expected: `8 passed`, with 185 deselected. This takes two to three minutes.
+Expected: `8 passed`, with 188 deselected. This takes two to three minutes.
 
 - [ ] **Step 3: Run the tool on the Twister dump**
 
@@ -5264,7 +5320,7 @@ Differences in `cRP TimeElapsed` and in the editor interface state fields listed
 
 The work is complete when:
 
-- `uv run --with pytest --with numpy pytest -q` prints `185 passed`;
+- `uv run --with pytest --with numpy pytest -q` prints `188 passed`;
 - `uv run --with pytest --with numpy pytest -q -s -m "twister or libserum"` prints `8 passed`;
 - the two hand-offs of Tasks 20 and 22 have been given to the user.
 
