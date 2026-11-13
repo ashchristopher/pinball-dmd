@@ -603,3 +603,53 @@ def choose_masks(work, regions, options):
             heapq.heappush(queue, fresh)
             continue
         work.apply(candidate, labels, good)
+
+
+def _group_table(work):
+    """The current groups as arrays.
+
+    Returns (kept, group, sizes, order, starts, varying): kept frame of every
+    group, group number of every frame, group sizes, the frames sorted by group,
+    the start of every group in that order, and per group the pixels at which
+    its members differ in value.
+    """
+    kept, group, sizes = np.unique(work.root, return_inverse=True, return_counts=True)
+    order = np.argsort(group, kind="stable")
+    starts = np.concatenate(([0], np.cumsum(sizes)[:-1]))
+    varying = np.zeros((len(kept), work.frames.shape[1]), bool)
+    for first, differ in varying_batches(work.frames, order, starts):
+        varying[first:first + len(differ)] = differ
+    return kept, group, sizes, order, starts, varying
+
+
+def tighten(work, options):
+    """Step D of the design: give every merged group the first setting that reproduces it."""
+    kept, group, sizes, order, starts, varying = _group_table(work)
+    pending = sizes > 1
+    settings = [(-1, True)] if options.shape_mode else []
+    by_area = sorted(range(len(work.pool)), key=lambda number: (work.pool[number].area, number))
+    for number in by_area:
+        settings.append((number, False))
+        if options.shape_mode:
+            settings.append((number, True))
+    for number, shape in settings:
+        if not pending.any():
+            break
+        chosen = work.pool[number] if number >= 0 else None
+        labels = work.labellers[shape].labels(chosen.blocks if chosen else None)
+        class_sizes = np.bincount(labels)
+        kept_label = labels[kept]
+        together = np.logical_and.reduceat(labels[order] == kept_label[group[order]], starts)
+        fits = np.flatnonzero(pending & together & (class_sizes[kept_label] == sizes))
+        if not len(fits):
+            continue
+        if chosen is None:
+            passes = varying[fits].sum(axis=1) <= work.limit
+        else:
+            passes = chosen.area + (varying[fits] & ~chosen.mask).sum(axis=1) <= work.limit
+            passes &= work.lit_outside(kept[fits], chosen.cells) >= work.min_lit
+        settled = fits[passes]
+        frames = np.isin(group, settled)
+        work.group_mask[frames] = number
+        work.group_shape[frames] = shape
+        pending[settled] = False
