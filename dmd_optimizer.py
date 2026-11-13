@@ -1261,3 +1261,175 @@ def report_html(dump, analysis, rom_name):
             out.append(section("shape-only", title, numbers))
     out.append("</body></html>")
     return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Part 5: command line
+# ---------------------------------------------------------------------------
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="dmd_optimizer.py",
+        description="Write a ColorizingDMD project in which frames of a VPinMAME dump that show "
+        "the same screen are already merged by comparison masks and shape mode.",
+    )
+    parser.add_argument("dumps", nargs="+", metavar="DUMP", help="VPinMAME dump file (.txt); all of the same ROM")
+    parser.add_argument("--out-dir", metavar="DIR", help="output folder (default: <rom>-optimized)")
+    parser.add_argument("--rom-name", metavar="NAME", help="ROM name (default: first dump's file name)")
+    parser.add_argument("--max-vary", type=float, default=25.0, metavar="PCT",
+                        help="percent of the display that may vary inside a merged group (default: 25)")
+    parser.add_argument("--max-masks", type=int, default=64, metavar="N",
+                        help="mask slots the tool may use, 0 to 64 (default: 64)")
+    parser.add_argument("--min-gain", type=int, default=5, metavar="N",
+                        help="frames a mask must save to be used (default: 5)")
+    parser.add_argument("--min-lit", type=int, default=None, metavar="PIXELS",
+                        help="lit pixels that must remain outside a mask (default: display pixels / 128)")
+    parser.add_argument("--no-shape-mode", action="store_true", help="compare exact pixel values only")
+    parser.add_argument("--force", action="store_true", help="overwrite existing output files")
+    return parser
+
+
+class InstallError(OptimizerError):
+    """Moving the output files into place failed and not everything could be put back."""
+
+
+def install_files(staged, targets, staging, force):
+    """Move the staged files onto the targets.
+
+    With force, a target that exists is first moved into the staging folder.
+    Without force, each target name is claimed by creating the file exclusively,
+    which fails if the file exists, so nothing can be overwritten by accident.
+    A folder is never replaced. If any step fails, every target is put back as
+    it was and OptimizerError is raised. If putting back fails too, InstallError
+    names the files to check by hand.
+    """
+    moved = []  # (target, its previous version inside the staging folder or None)
+    try:
+        for source, target in zip(staged, targets):
+            previous = None
+            if not force:
+                open(target, "xb").close()
+            elif os.path.lexists(target):  # lexists also sees a link that points nowhere
+                previous = staging / (target.name + ".previous")
+                os.replace(target, previous)
+            moved.append((target, previous))
+            if previous is not None and previous.is_dir() and not previous.is_symlink():
+                raise OSError(f"{target} is a folder, not a file")
+            os.replace(source, target)
+    except OSError as error:
+        stranded = []
+        for target, previous in reversed(moved):
+            try:
+                if previous is not None:
+                    os.replace(previous, target)
+                elif os.path.lexists(target):
+                    os.remove(target)
+            except OSError:
+                stranded.append(str(target if previous is None else previous))
+        if isinstance(error, FileExistsError):
+            reason = f"{error.filename} already exists; pass --force to overwrite it"
+        else:
+            reason = f"cannot write the output files: {error}"
+        if stranded:
+            raise InstallError(
+                f"{reason}. Putting the previous state back failed as well; "
+                f"check these files by hand: {', '.join(stranded)}"
+            ) from None
+        raise OptimizerError(reason) from None
+
+
+def run(args):
+    """Run the tool for parsed arguments. Returns the exit status; raises OptimizerError."""
+    if not 0 <= args.max_vary <= 100:
+        raise OptimizerError("--max-vary must be between 0 and 100")
+    if not 0 <= args.max_masks <= 64:
+        raise OptimizerError("--max-masks must be between 0 and 64")
+    if args.min_gain < 1:
+        raise OptimizerError("--min-gain must be at least 1")
+    if args.min_lit is not None and args.min_lit < 0:
+        raise OptimizerError("--min-lit must not be negative")
+    rom_name = args.rom_name or Path(args.dumps[0]).stem
+    check_rom_name(rom_name)
+    out_dir = Path(args.out_dir) if args.out_dir else Path(f"{rom_name}-optimized")
+    targets = [out_dir / f"{rom_name}.cROM", out_dir / f"{rom_name}.cRP", out_dir / f"{rom_name}-report.html"]
+
+    for target in targets:
+        if target.is_dir() and not target.is_symlink():
+            raise OptimizerError(f"{target} is a folder; the tool replaces files only")
+        if os.path.lexists(target) and not args.force:
+            raise OptimizerError(f"{target} already exists; pass --force to overwrite it")
+
+    def say(message):
+        print(f"dmd_optimizer: {message}", file=sys.stderr)
+
+    say("reading dumps")
+    dump = read_dumps(args.dumps)
+    for warning in dump.warnings:
+        say(f"warning: {warning}")
+    options = Options(
+        max_vary=args.max_vary,
+        max_masks=args.max_masks,
+        min_gain=args.min_gain,
+        min_lit=args.min_lit,
+        shape_mode=not args.no_shape_mode,
+    )
+    analysis = analyze(dump, options, say)
+    project = new_project(dump, analysis, rom_name)
+    created = not out_dir.exists()
+    staging = None
+    keep_staging = False
+    done = False
+    try:
+        say("writing files")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix=".dmd_optimizer-", dir=out_dir))
+        staged = [staging / target.name for target in targets]
+        write_project(project, staged[0], staged[1])
+        staged[2].write_text(report_html(dump, analysis, rom_name), encoding="utf-8")
+        install_files(staged, targets, staging, args.force)
+        done = True
+    except InstallError:
+        keep_staging = True  # it holds previous versions that could not be put back
+        raise
+    except OSError as error:
+        raise OptimizerError(f"cannot write the output files: {error}") from None
+    finally:
+        if staging is not None and not keep_staging:
+            try:
+                shutil.rmtree(staging)
+            except OSError as error:
+                say(f"warning: could not remove the temporary folder {staging}: {error}")
+        if created and not done:
+            try:
+                if not os.listdir(out_dir):
+                    os.rmdir(out_dir)
+            except FileNotFoundError:
+                pass  # the folder was never created
+            except OSError as error:
+                say(f"warning: could not remove the empty folder {out_dir}: {error}")
+    for label, value in summarize(dump, analysis).items():
+        print(f"{label}: {value}")
+    for target in targets:
+        print(f"wrote {target}")
+    return 0
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        return run(args)
+    except OptimizerError as error:
+        print(f"dmd_optimizer: error: {error}", file=sys.stderr)
+        return 1
+    except MemoryError:
+        print(
+            "dmd_optimizer: error: not enough memory. Allow about 60 KB per distinct 128x32 frame "
+            "and 180 KB per distinct 192x64 frame, or give the tool fewer dump files at once",
+            file=sys.stderr,
+        )
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
