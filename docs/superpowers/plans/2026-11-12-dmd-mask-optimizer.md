@@ -45,7 +45,7 @@ Tech Stack: Python 3.10 or later, numpy 2.0 or later (the only dependency of the
 | `pytest.ini` | Test configuration. Tests that need downloads are opt-in |
 | `.gitignore` | Keeps downloads, build caches and output folders out of git |
 | `README.md` | How to run the tool and the tests |
-| `tests/helpers.py` | Made-up frames, a dump text writer, and an independent brute-force check of the design's rules |
+| `tests/helpers.py` | Made-up frames, a dump text writer, an independent check of the design's rules, and the benchmark measure |
 | `tests/conftest.py` | Session fixtures for the Twister files |
 | `tests/test_*.py` | One test file per task |
 | `tools/make_sample_dump.py` | Copies the first records of a dump (for the fresh-import check) |
@@ -68,9 +68,9 @@ Tech Stack: Python 3.10 or later, numpy 2.0 or later (the only dependency of the
 
 1. **Unit tests** for every function, in one test file per task (Tasks 2 to 17). Each task follows the cycle: write the test, see it fail, add the code, see it pass, commit.
 2. **Scenario tests** of the whole analysis on made-up dumps with a known answer (Task 13): a counting score, a flickering title, a looping animation, two different screens, brightness changes beyond the limit, and a screen that is blank outside the varying area.
-3. **An independent rule check.** `tests/helpers.py` contains `check_rules`, a brute-force implementation of rules R1 to R6 of the design that shares no code with the tool. Tasks 12 and 13 run it on every result.
+3. **An independent rule check.** `tests/helpers.py` contains `check_rules`, an implementation of rules R1 to R6 of the design by exact comparison that shares no code with the tool. Tasks 12 and 13 run it on every result, Task 13 tests that it rejects wrong results, and Task 19 runs it on the Twister result.
 4. **Error handling** is tested where each error is raised: unreadable and unsupported dumps (Tasks 2, 3), damaged project files (Task 14), unusable ROM names (Task 15), option ranges, overwrite refusal, write failures and clean-up after a failed run (Task 17), and the tool's own verification failing (Task 12).
-5. **Real data, opt-in** (Task 19): the Twister dump and a hand-made Twister project. Reading and rewriting the hand-made project must reproduce it byte for byte, and the benchmark has fixed thresholds.
+5. **Real data, opt-in** (Task 19): the Twister dump and a hand-made Twister project. Reading and rewriting the hand-made project must reproduce it byte for byte, the benchmark has fixed thresholds, rules R1 to R6 are checked on the result, and a second analysis must give the same result (rule R7).
 6. **An independent oracle, opt-in** (Task 21): the real libserum must identify every dump frame as the tool predicts.
 7. **Two checks only the user can run** in ColorizingDMD on Windows (Tasks 20 and 22 prepare them).
 
@@ -100,7 +100,8 @@ The repository holds only `docs/` so far. This task adds the test configuration,
 
 - `artwork(variant)` draws a fixed screen. Two variants differ over 1,120 pixels, more than a quarter of a 128x32 display, so the tool must treat them as different screens.
 - `score_frames`, `flicker_frames`, `animation_frames`, `two_screens`, `bright_frames` and `score_only_frames` build the scenarios of design section 12.1.
-- `check_rules` checks rules R1 to R6 of design section 7.2 by brute force. It is deliberately independent of the tool. Never change it to make a test pass.
+- `check_rules` checks rules R1 to R6 of design section 7.2 by exact comparison. It is deliberately independent of the tool. Never change it to make a test pass. Task 13 adds tests that prove it rejects wrong results.
+- `hand_labels` is the measure used by the Twister benchmark in Task 19 (design section 12.2).
 
 - [ ] **Step 1: Create the test configuration**
 
@@ -244,7 +245,12 @@ def write_dump(path, frames, times=None, newline="\n"):
 
 
 def check_rules(dump, analysis, options):
-    """Check rules R1 to R6 of the design by brute force, independently of the tool's own checks."""
+    """Check rules R1 to R6 of the design by exact comparison, independently of the tool's own checks.
+
+    R5 is checked up to ties: of two masks with the same area, the checker cannot
+    tell which came first in the pool, so it only requires that no setting with a
+    smaller mask, no mask at all, or a tighter view reproduces a group.
+    """
     frames = dump.frames
     count, pixels = frames.shape
     limit = int(options.max_vary * pixels // 100)
@@ -252,14 +258,24 @@ def check_rules(dump, analysis, options):
     views = {False: frames, True: (frames > 0).astype(np.uint8)}
     masks = analysis.masks
     none = np.zeros(pixels, bool)
+    partitions = {}
 
     def mask_of(number):
         return none if number == 255 else masks[number]
 
-    def members_under(kept, number, shape):
-        keep = ~mask_of(number)
-        view = views[shape]
-        return np.flatnonzero((view[:, keep] == view[kept][keep]).all(axis=1))
+    def classes(number, shape):
+        """A label per frame; equal labels mean equal pixels outside the mask in the view."""
+        if (number, shape) not in partitions:
+            rows = np.ascontiguousarray(views[shape][:, ~mask_of(number)])
+            seen = {}
+            labels = [seen.setdefault(row.tobytes(), len(seen)) for row in rows]
+            partitions[number, shape] = np.array(labels)
+        return partitions[number, shape]
+
+    def reproduces(members, kept, number, shape):
+        labels = classes(number, shape)
+        same = labels == labels[kept]
+        return int(same.sum()) == len(members) and bool(same[members].all())
 
     def passes(kept, varying, number):
         mask = mask_of(number)
@@ -268,6 +284,7 @@ def check_rules(dump, analysis, options):
         return number == 255 or (frames[kept] > 0)[~mask].sum() >= min_lit
 
     assert len(masks) <= min(options.max_masks, 64), "R4: too many masks"
+    areas = [int(mask.sum()) for mask in masks]
     seen = np.zeros(count, int)
     used = set()
     saved = [0] * len(masks)
@@ -278,7 +295,7 @@ def check_rules(dump, analysis, options):
         seen[members] += 1
         varying = (frames[members] != frames[group.kept]).any(axis=0)
         assert np.array_equal(varying, group.varying), "varying map is wrong"
-        assert np.array_equal(members_under(group.kept, group.mask, group.shape), members), "R1"
+        assert reproduces(members, group.kept, group.mask, group.shape), "R1"
         assert passes(group.kept, varying, group.mask), "R2 or R3"
         data = frames[group.kept][~mask_of(group.mask)]
         if group.shape:
@@ -293,26 +310,56 @@ def check_rules(dump, analysis, options):
         if not options.shape_mode:
             assert not group.shape, "shape view used although it is disabled"
         # R5: no setting that comes earlier in step D's order reproduces the group
-        area = int(mask_of(group.mask).sum())
         earlier = []
         if group.shape:
             earlier.append((group.mask, False))
         if group.mask != 255:
             earlier.append((255, True))
             for number in range(len(masks)):
-                if int(masks[number].sum()) < area:
+                if areas[number] < areas[group.mask]:
                     earlier.extend([(number, False), (number, True)])
         for number, shape in earlier:
             if shape and not options.shape_mode:
                 continue
-            same = np.array_equal(members_under(group.kept, number, shape), members)
-            assert not (same and passes(group.kept, varying, number)), "R5: a tighter setting exists"
+            tighter = reproduces(members, group.kept, number, shape) and passes(group.kept, varying, number)
+            assert not tighter, "R5: a tighter setting exists"
     assert (seen == 1).all(), "a frame is in no group or in several"
     assert used == set(range(len(masks))), "a mask is unused or missing"
     assert saved == list(analysis.mask_saved), "frames saved per mask"
     assert saved == sorted(saved, reverse=True), "masks are not numbered by frames saved"
     kept = [group.kept for group in analysis.groups]
     assert kept == sorted(kept), "R6: kept frames are not in order of first appearance"
+
+
+def hand_labels(frames, project):
+    """For every frame: the lowest-numbered frame of a project that identifies it, or -1.
+
+    A project frame identifies a frame when both are equal at every pixel outside
+    the project frame's mask, in its view (design section 12.2). Pixels are
+    compared exactly; no hash is involved.
+    """
+    crom = project.crom
+    pixels = frames.shape[1]
+    originals = project.crp["oFrames"].reshape(-1, pixels)
+    masks = crom["CompMasks"].reshape(-1, pixels)
+    labels = np.full(len(frames), -1, np.int64)
+    settings = sorted(set(zip(crom["CompMaskID"].tolist(), crom["ShapeCompMode"].tolist())))
+    for mask_number, shape in settings:
+        keep = np.ones(pixels, bool) if mask_number == 255 else masks[mask_number] == 0
+
+        def compared(rows):
+            rows = rows[:, keep]
+            return np.ascontiguousarray(np.minimum(rows, 1) if shape else rows)
+
+        users = np.flatnonzero((crom["CompMaskID"] == mask_number) & (crom["ShapeCompMode"] == shape))
+        lowest = {}
+        for number, row in zip(users.tolist(), compared(originals[users])):
+            lowest.setdefault(row.tobytes(), number)
+        for frame, row in enumerate(compared(frames)):
+            found = lowest.get(row.tobytes(), -1)
+            if found >= 0 and (labels[frame] < 0 or found < labels[frame]):
+                labels[frame] = found
+    return labels
 ```
 
 - [ ] **Step 3: Write the failing test**
@@ -406,7 +453,7 @@ Files:
 
 Design section 6. A dump is text: a timestamp line `0x` plus 8 hex digits (milliseconds), then one line of hex digits per pixel row, then a blank line. `parse_dump_text` turns the bytes of one file into an array of frames and an array of timestamps.
 
-Reading stops, with a warning, at the first record that is incomplete or holds a character other than a hex digit. The frame size comes from the first record and must be 128x32 or 192x64.
+Reading stops, with a warning, at the first record that is incomplete or holds a character other than a hex digit. If other text follows the rows of a complete record, that record is kept and reading stops after it. Blank lines are ignored everywhere, as the editor ignores them. The frame size comes from the first record and must be 128x32 or 192x64.
 
 The tests cover:
 
@@ -414,6 +461,8 @@ The tests cover:
 - CRLF and LF line endings
 - hex digits in lower and upper case
 - a truncated last record, a short row and a letter beyond `f` (reading stops with a warning naming the record)
+- text after a complete record (the record is kept, reading stops)
+- blank lines between the rows of a record (ignored)
 - an unsupported size, a file with no frame, and a file cut inside its first record (errors)
 
 - [ ] **Step 1: Write the failing test**
@@ -484,6 +533,21 @@ def test_letter_beyond_f_stops_reading():
     assert len(parsed) == 1 and "record 2" in warning
 
 
+def test_text_after_a_complete_record_stops_reading_and_keeps_the_record():
+    first, second, third = (dump_text([frame]) for frame in score_frames(3))
+    damaged = second.replace(b"0x000003e8", b"0x3e8")  # a timestamp with too few digits
+    parsed, times, _, warning = tool.parse_dump_text(first + damaged + third, "a.txt")
+    assert len(parsed) == 1 and times.tolist() == [1000]
+    assert warning == "a.txt: unexpected text after record 1; reading stopped there"
+
+
+def test_blank_lines_inside_a_record_are_ignored():
+    lines = dump_text(score_frames(3)).split(b"\n")
+    lines.insert(H + 2 + 7, b"")  # a blank line between two rows of the second record
+    parsed, _, _, warning = tool.parse_dump_text(b"\n".join(lines), "a.txt")
+    assert len(parsed) == 3 and warning is None
+
+
 def test_unsupported_size_is_an_error():
     with pytest.raises(tool.OptimizerError, match="64x16 is not supported"):
         tool.parse_dump_text(dump_text([blank(64, 16)]), "a.txt")
@@ -505,7 +569,7 @@ def test_a_file_cut_inside_its_first_record_is_an_error():
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `uv run --with pytest --with numpy pytest -q tests/test_dump_parse.py`
-Expected: `10 failed`, with `AttributeError: module 'dmd_optimizer' has no attribute 'parse_dump_text'`.
+Expected: `12 failed`, with `AttributeError: module 'dmd_optimizer' has no attribute 'parse_dump_text'`.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -532,6 +596,7 @@ def parse_dump_text(data, name):
     Returns (frames, times, (width, height), warning):
     frames is uint8 [records, width * height], times is uint32 [records] in
     milliseconds, and warning is None or a message saying where reading stopped.
+    Blank lines are ignored everywhere, as ColorizingDMD ignores them.
     """
     data = data.replace(b"\r", b"")
     marks = list(_TIMESTAMP.finditer(data))
@@ -545,16 +610,21 @@ def parse_dump_text(data, name):
         if size is None:
             if not lines:
                 break
-            size = (len(lines[0]), len(lines))
+            width = len(lines[0])
+            height = 0
+            while height < len(lines) and len(lines[height]) == width:
+                height += 1
+            size = (width, height)
             if size not in SUPPORTED_SIZES:
                 raise OptimizerError(
-                    f"{name}: frame size {size[0]}x{size[1]} is not supported "
+                    f"{name}: frame size {width}x{height} is not supported "
                     "(supported sizes are 128x32 and 192x64)"
                 )
         width, height = size
+        rows = lines[:height]
         pixels = None
-        if len(lines) == height and all(len(line) == width for line in lines):
-            pixels = _PIXEL_VALUE[np.frombuffer(b"".join(lines), np.uint8)]
+        if len(rows) == height and all(len(row) == width for row in rows):
+            pixels = _PIXEL_VALUE[np.frombuffer(b"".join(rows), np.uint8)]
             if (pixels == 255).any():
                 pixels = None
         if pixels is None:
@@ -562,6 +632,9 @@ def parse_dump_text(data, name):
             break
         frames.append(pixels)
         times.append(int(mark.group(1), 16))
+        if len(lines) > height:
+            warning = f"{name}: unexpected text after record {number}; reading stopped there"
+            break
     if not frames:
         raise OptimizerError(f"{name}: no complete frame found")
     return np.stack(frames), np.array(times, np.uint32), size, warning
@@ -570,10 +643,10 @@ def parse_dump_text(data, name):
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `uv run --with pytest --with numpy pytest -q tests/test_dump_parse.py`
-Expected: `10 passed`.
+Expected: `12 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `12 passed`.
+Expected: `14 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -764,7 +837,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_dump_read.py`
 Expected: `7 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `19 passed`.
+Expected: `21 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -886,7 +959,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_hashing.py`
 Expected: `5 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `24 passed`.
+Expected: `26 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -1062,7 +1135,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_padding.py`
 Expected: `9 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `33 passed`.
+Expected: `35 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -1200,7 +1273,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_options_links.py`
 Expected: `5 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `38 passed`.
+Expected: `40 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -1379,7 +1452,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_candidate_regions.p
 Expected: `7 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `45 passed`.
+Expected: `47 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -1548,7 +1621,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_labeller.py`
 Expected: `4 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `49 passed`.
+Expected: `51 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -1828,7 +1901,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_workspace.py`
 Expected: `7 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `56 passed`.
+Expected: `58 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -1998,7 +2071,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_choose_masks.py`
 Expected: `8 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `64 passed`.
+Expected: `66 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -2024,6 +2097,7 @@ Design section 7.3, step D, and rule R5. Step C may leave a group with a larger 
 The tests cover:
 
 - a group moves to the smallest region that still merges it, and its view becomes the value view when that is enough
+- of two regions with the same area, the earlier one in the pool wins
 - a flicker group keeps no mask and the shape view
 - a masked shape-view group loses its mask when the shapes are equal
 - single frames are untouched
@@ -2078,6 +2152,19 @@ def test_a_group_moves_to_the_smallest_region_that_still_merges_it(tmp_path):
     assert not work.group_shape.any()  # the value view is enough for both groups
 
 
+def test_of_two_regions_with_the_same_area_the_earlier_one_in_the_pool_wins(tmp_path):
+    left = rectangle(36, 20, 64, 30)  # both cover the score, and both have 280 pixels
+    right = SMALL
+    assert int(left.sum()) == int(right.sum()) == 280
+    for first, second in ((left, right), (right, left)):
+        work, options = workspace(tmp_path, score_frames(6))
+        merge(work, work.candidate(0, LARGE, False))
+        work.pool.append(work.candidate(1, first, False))
+        work.pool.append(work.candidate(2, second, False))
+        tool.tighten(work, options)
+        assert work.group_mask.tolist() == [1] * 6
+
+
 def test_a_flicker_group_keeps_no_mask_and_the_shape_view(tmp_path):
     work, options = workspace(tmp_path, flicker_frames(8))
     merge(work, tool.Candidate(region=-1, mask=None, cells=None, blocks=None, area=0, shape=True))
@@ -2110,7 +2197,7 @@ def test_without_shape_mode_only_value_settings_are_tried(tmp_path):
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `uv run --with pytest --with numpy pytest -q tests/test_tighten.py`
-Expected: `5 failed`, with `AttributeError: module 'dmd_optimizer' has no attribute 'tighten'`.
+Expected: `6 failed`, with `AttributeError: module 'dmd_optimizer' has no attribute 'tighten'`.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -2169,10 +2256,10 @@ def tighten(work, options):
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `uv run --with pytest --with numpy pytest -q tests/test_tighten.py`
-Expected: `5 passed`.
+Expected: `6 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `69 passed`.
+Expected: `72 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -2198,6 +2285,7 @@ Design section 7.3, step E. `finish` drops regions no group uses, numbers the ma
 The tests cover:
 
 - groups, mask numbers, shape flags, frames saved and hashes of a mixed dump, checked with `check_rules`
+- masks that save equally are numbered by area, and with equal areas in the order they were chosen
 - regions that end up unused are dropped
 - no masks gives an empty mask array
 - verification rejects a frame that matches two kept frames and a frame that matches none
@@ -2212,7 +2300,7 @@ import numpy as np
 import pytest
 
 import dmd_optimizer as tool
-from helpers import H, W, check_rules, flicker_frames, score_frames, write_dump
+from helpers import H, W, artwork, check_rules, draw_digits, flicker_frames, score_frames, write_dump
 
 
 def finished(tmp_path, frames, **settings):
@@ -2241,6 +2329,25 @@ def test_groups_masks_and_hashes(tmp_path):
     for group in analysis.groups:
         mask = None if group.mask == tool.NO_MASK else analysis.masks[group.mask]
         assert group.hash == tool.frame_hash(dump.frames[group.kept], mask, group.shape)
+
+
+def test_masks_that_save_equally_are_numbered_by_area(tmp_path):
+    wide = score_frames(7, variant=0, x=8)  # six digits change
+    narrow = [draw_digits(artwork(1), f"{11 * (k + 1):02d}", 60, 22) for k in range(7)]  # two digits change
+    dump, options, _, analysis = finished(tmp_path, wide + narrow)
+    check_rules(dump, analysis, options)
+    assert analysis.mask_saved == [6, 6]
+    assert int(analysis.masks[0].sum()) < int(analysis.masks[1].sum())
+    assert [group.mask for group in analysis.groups] == [1, 0]  # the narrow region is mask 0
+
+
+def test_masks_that_save_equally_with_equal_areas_keep_the_order_they_were_chosen_in(tmp_path):
+    frames = score_frames(7, variant=0, x=8) + score_frames(7, variant=1, x=48)
+    dump, options, _, analysis = finished(tmp_path, frames)
+    check_rules(dump, analysis, options)
+    assert analysis.mask_saved == [6, 6]
+    assert int(analysis.masks[0].sum()) == int(analysis.masks[1].sum())
+    assert [group.mask for group in analysis.groups] == [0, 1]
 
 
 def test_regions_that_end_up_unused_are_dropped(tmp_path):
@@ -2289,7 +2396,7 @@ def test_crc_collisions_are_reported_not_fatal(tmp_path, monkeypatch):
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `uv run --with pytest --with numpy pytest -q tests/test_finish.py`
-Expected: `6 failed`, with `AttributeError: module 'dmd_optimizer' has no attribute 'finish'`.
+Expected: `8 failed`, with `AttributeError: module 'dmd_optimizer' has no attribute 'finish'`.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -2400,10 +2507,10 @@ def finish(work, options):
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `uv run --with pytest --with numpy pytest -q tests/test_finish.py`
-Expected: `6 passed`.
+Expected: `8 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `75 passed`.
+Expected: `80 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -2421,8 +2528,11 @@ Depends on: Task 12 and all tasks before it.
 Files:
 - Modify: `dmd_optimizer.py` (append)
 - Test: `tests/test_analyze.py`
+- Test: `tests/test_helpers.py`
 
-Design section 7. `analyze` runs steps A to E in order. Candidate regions are collected from the value view first and then from the shape view, without duplicates. The tests are the scenarios of design section 12.1, and each result is checked with `check_rules`.
+Design section 7. `analyze` runs steps A to E in order. Candidate regions are collected from the value view first and then from the shape view, without duplicates. The tests in `tests/test_analyze.py` are the scenarios of design section 12.1, and each result is checked with `check_rules`.
+
+`tests/test_helpers.py` tests the test helpers themselves. `check_rules` decides whether a result is right, so it must reject wrong results: a group split in two, a looser view than needed, a result over the limits, a wrong order, a missing frame and a wrong hash. `hand_labels` is the measure used by the Twister benchmark in Task 19.
 
 The tests cover:
 
@@ -2435,6 +2545,8 @@ The tests cover:
 - frames spread over several files
 - progress messages and default options
 - two runs give the same result (rule R7)
+- `check_rules` accepts a correct result and rejects six kinds of wrong result
+- `hand_labels` picks the lowest-numbered project frame that matches exactly
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2572,10 +2684,116 @@ def test_the_result_does_not_depend_on_the_run(tmp_path):
     assert [group.hash for group in first.groups] == [group.hash for group in second.groups]
 ```
 
+Create `tests/test_helpers.py`:
+
+```python
+"""The test helpers decide whether results are right, so they are tested too."""
+import copy
+import types
+import zlib
+
+import numpy as np
+import pytest
+
+import dmd_optimizer as tool
+from helpers import artwork, check_rules, flicker_frames, hand_labels, score_frames, write_dump
+
+
+@pytest.fixture
+def result(tmp_path):
+    frames = score_frames(12) + flicker_frames(10, variant=1) + [artwork(2)]
+    dump = tool.read_dumps([write_dump(tmp_path / "x.txt", frames)])
+    return dump, tool.analyze(dump)
+
+
+def test_a_correct_result_passes(result):
+    check_rules(*result, tool.Options())
+
+
+def test_a_group_split_in_two_is_rejected(result):
+    dump, analysis = result
+    whole = analysis.groups[0]
+    halves = []
+    for members in (whole.members[:6], whole.members[6:]):
+        half = copy.copy(whole)
+        half.kept, half.members = int(members[0]), members
+        half.varying = (dump.frames[members] != dump.frames[members[0]]).any(axis=0)
+        half.hash = tool.frame_hash(dump.frames[members[0]], analysis.masks[whole.mask])
+        halves.append(half)
+    analysis.groups[0:1] = halves
+    with pytest.raises(AssertionError, match="R1"):
+        check_rules(dump, analysis, tool.Options())
+
+
+def test_a_view_looser_than_needed_is_rejected(result):
+    dump, analysis = result
+    group = analysis.groups[0]
+    group.shape = True
+    kept = dump.frames[group.kept][~analysis.masks[group.mask]]
+    group.hash = zlib.crc32(np.minimum(kept, 1).tobytes())
+    with pytest.raises(AssertionError, match="R5"):
+        check_rules(dump, analysis, tool.Options())
+
+
+def test_limits_are_enforced(result):
+    dump, analysis = result
+    with pytest.raises(AssertionError, match="R2 or R3"):
+        check_rules(dump, analysis, tool.Options(max_vary=2))  # the score mask covers more than 2%
+    with pytest.raises(AssertionError, match="R2 or R3"):
+        check_rules(dump, analysis, tool.Options(min_lit=4000))
+    with pytest.raises(AssertionError, match="R4"):
+        check_rules(dump, analysis, tool.Options(max_masks=0))
+    with pytest.raises(AssertionError, match="shape view used although it is disabled"):
+        check_rules(dump, analysis, tool.Options(shape_mode=False))
+
+
+def test_wrong_order_and_missing_frames_are_rejected(result):
+    dump, analysis = result
+    backwards = copy.copy(analysis)
+    backwards.groups = analysis.groups[::-1]
+    with pytest.raises(AssertionError, match="R6"):
+        check_rules(dump, backwards, tool.Options())
+    short = copy.copy(analysis)
+    short.groups = analysis.groups[:-1]
+    with pytest.raises(AssertionError, match="a frame is in no group or in several"):
+        check_rules(dump, short, tool.Options())
+
+
+def test_a_wrong_hash_is_rejected(result):
+    dump, analysis = result
+    analysis.groups[2].hash ^= 1
+    with pytest.raises(AssertionError, match="hash"):
+        check_rules(dump, analysis, tool.Options())
+
+
+def test_hand_labels_pick_the_lowest_project_frame_that_matches_exactly():
+    mask = np.array([0, 0, 0, 0, 1, 1, 1, 1], np.uint8)
+    originals = np.array([
+        [1, 2, 3, 0, 9, 9, 9, 9],  # frame 0: mask 0, value view
+        [3, 3, 0, 0, 1, 1, 0, 0],  # frame 1: no mask, value view
+        [3, 3, 0, 0, 1, 1, 0, 0],  # frame 2: a duplicate of frame 1
+        [2, 0, 2, 0, 2, 0, 2, 0],  # frame 3: no mask, shape view
+    ], np.uint8)
+    project = types.SimpleNamespace(
+        crom={"CompMaskID": np.array([0, 255, 255, 255], np.uint8),
+              "ShapeCompMode": np.array([0, 0, 0, 1], np.uint8),
+              "CompMasks": mask},
+        crp={"oFrames": originals.reshape(-1)},
+    )
+    frames = np.array([
+        [1, 2, 3, 0, 0, 1, 2, 3],  # equal to frame 0 outside the mask
+        [3, 3, 0, 0, 1, 1, 0, 0],  # equal to frames 1 and 2: the lower number wins
+        [1, 0, 3, 0, 1, 0, 3, 0],  # the lit shape of frame 3
+        [1, 2, 3, 1, 9, 9, 9, 9],  # differs from frame 0 outside the mask
+        [0, 0, 0, 0, 0, 0, 0, 0],  # matches nothing
+    ], np.uint8)
+    assert hand_labels(frames, project).tolist() == [0, 1, 3, -1, -1]
+```
+
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `uv run --with pytest --with numpy pytest -q tests/test_analyze.py`
-Expected: `15 failed`, with `AttributeError: module 'dmd_optimizer' has no attribute 'analyze'`.
+Run: `uv run --with pytest --with numpy pytest -q tests/test_analyze.py tests/test_helpers.py`
+Expected: `15 failed, 1 passed, 6 errors`, with `AttributeError: module 'dmd_optimizer' has no attribute 'analyze'`. The one test that passes already exercises `hand_labels`, which needs only the test helpers. The errors come from a fixture that calls `analyze`.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -2615,16 +2833,16 @@ def analyze(dump, options=None, progress=None):
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `uv run --with pytest --with numpy pytest -q tests/test_analyze.py`
-Expected: `15 passed`.
+Run: `uv run --with pytest --with numpy pytest -q tests/test_analyze.py tests/test_helpers.py`
+Expected: `22 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `90 passed`.
+Expected: `102 passed`.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add dmd_optimizer.py tests/test_analyze.py
+git add dmd_optimizer.py tests/test_analyze.py tests/test_helpers.py
 git commit -m "feat: analyse a dump end to end"
 ```
 
@@ -2787,7 +3005,7 @@ def test_damaged_files_are_refused(tmp_path):
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `uv run --with pytest --with numpy pytest -q tests/test_project_files.py`
-Expected: `7 failed, 1 passed`, with `AttributeError: module 'dmd_optimizer' has no attribute '_crom_layout'`. One test passes already because it only checks arithmetic inside the test file.
+Expected: `7 failed, 1 passed`, with `AttributeError: module 'dmd_optimizer' has no attribute '_crom_layout'`. The one test that passes already only checks arithmetic inside the test file.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -2980,7 +3198,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_project_files.py`
 Expected: `8 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `98 passed`.
+Expected: `110 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -3253,7 +3471,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_new_project.py`
 Expected: `16 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `114 passed`.
+Expected: `126 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -3628,7 +3846,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_report.py`
 Expected: `10 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `124 passed`.
+Expected: `136 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -3649,7 +3867,9 @@ Files:
 
 Design sections 5 and 11. `main` parses the arguments, calls `run` and turns an `OptimizerError` into one line on standard error and exit status 1.
 
-`run` refuses to overwrite existing output files unless `--force` is given, and it checks that before any work is done. Files are written under `.tmp` names and renamed only when all three are complete. If anything fails, the temporary files are removed, and so is the output folder if this run created it and it is empty.
+`run` refuses to overwrite existing output files unless `--force` is given, and it checks that before any work is done. Files are written under `.tmp` names and moved into place by `install_files` only when all three are complete. If a move fails, `install_files` puts every file it already replaced back, so an existing project is either replaced completely or left exactly as it was. If anything fails, the temporary files are removed, and so is the output folder if this run created it and it is empty.
+
+Progress lines and warnings go to standard error while the tool works. A failed run prints exactly one line starting with `dmd_optimizer: error: `, as the last line on standard error, and nothing on standard output.
 
 This block is part 5 and ends the file. Nothing is appended to `dmd_optimizer.py` after this task.
 
@@ -3665,6 +3885,9 @@ The tests cover:
 - a truncated dump gives a warning and still works
 - a failed run leaves nothing behind, and leaves an existing folder as it was
 - a path that cannot be written
+- a move that fails at any of its steps leaves a new folder empty and restores existing files exactly
+- `--force` replaces all three files and leaves no extra files
+- every failed run prints exactly one error line, last on standard error
 - two runs give byte-identical files (rule R7)
 - `--help` lists every option
 
@@ -3687,6 +3910,14 @@ def dump_path(tmp_path):
 
 def files_in(folder):
     return sorted(path.name for path in folder.iterdir())
+
+
+def error_message(captured):
+    """The one error line of a failed run; it must be the last line on standard error."""
+    lines = captured.err.splitlines()
+    assert [line.startswith("dmd_optimizer: error: ") for line in lines].count(True) == 1
+    assert lines[-1].startswith("dmd_optimizer: error: ")
+    return lines[-1][len("dmd_optimizer: error: "):]
 
 
 def test_writes_three_files_and_a_summary(dump_path, tmp_path, capsys):
@@ -3763,21 +3994,24 @@ def test_options_change_the_result(dump_path, tmp_path):
 def test_values_out_of_range_are_errors(dump_path, tmp_path, capsys, arguments, message):
     out = tmp_path / "out"
     assert tool.main([str(dump_path), "--out-dir", str(out)] + arguments) == 1
-    assert message in capsys.readouterr().err and not out.exists()
+    captured = capsys.readouterr()
+    assert message in error_message(captured) and captured.err.count("\n") == 1
+    assert captured.out == "" and not out.exists()
 
 
 def test_dump_errors_are_reported(tmp_path, capsys):
     out = tmp_path / "out"
     assert tool.main([str(tmp_path / "missing.txt"), "--out-dir", str(out)]) == 1
-    assert "missing.txt: cannot read the file" in capsys.readouterr().err
+    assert "missing.txt: cannot read the file" in error_message(capsys.readouterr())
     odd = write_dump(tmp_path / "odd.txt", [blank(64, 16)])
     assert tool.main([str(odd), "--out-dir", str(out)]) == 1
-    assert "frame size 64x16 is not supported" in capsys.readouterr().err
+    assert "frame size 64x16 is not supported" in error_message(capsys.readouterr())
     mixed = write_dump(tmp_path / "large.txt", [blank(192, 64)])
     small = write_dump(tmp_path / "small.txt", [artwork()])
     assert tool.main([str(small), str(mixed), "--out-dir", str(out)]) == 1
-    assert "differs from 128x32" in capsys.readouterr().err
-    assert not out.exists()
+    captured = capsys.readouterr()
+    assert "differs from 128x32" in error_message(captured)
+    assert captured.out == "" and not out.exists()
 
 
 def test_a_truncated_dump_gives_a_warning_and_still_works(tmp_path, capsys):
@@ -3795,7 +4029,7 @@ def test_a_failed_run_leaves_nothing_behind(dump_path, tmp_path, capsys, monkeyp
     monkeypatch.setattr(tool, "report_html", broken)
     out = tmp_path / "out"
     assert tool.main([str(dump_path), "--out-dir", str(out)]) == 1
-    assert "internal check failed: test" in capsys.readouterr().err
+    assert error_message(capsys.readouterr()) == "internal check failed: test"
     assert not out.exists()
     out.mkdir()
     (out / "notes.txt").write_text("keep me")
@@ -3807,7 +4041,56 @@ def test_write_problems_are_reported(dump_path, tmp_path, capsys):
     blocker = tmp_path / "blocker"
     blocker.write_text("a file where the output folder should be")
     assert tool.main([str(dump_path), "--out-dir", str(blocker)]) == 1
-    assert "cannot write the output files" in capsys.readouterr().err
+    assert error_message(capsys.readouterr()).startswith("cannot write the output files: ")
+    assert blocker.read_text() == "a file where the output folder should be"
+
+
+def failing_replace(monkeypatch, fail_at):
+    """Make the fail_at-th call of os.replace inside the tool raise, once."""
+    real = tool.os.replace
+    calls = []
+
+    def replace(source, target):
+        calls.append((source, target))
+        if len(calls) == fail_at:
+            raise OSError("simulated failure")
+        return real(source, target)
+
+    monkeypatch.setattr(tool.os, "replace", replace)
+
+
+@pytest.mark.parametrize("fail_at", [1, 2, 3])
+def test_a_failed_move_into_a_new_folder_leaves_nothing(dump_path, tmp_path, capsys, monkeypatch, fail_at):
+    failing_replace(monkeypatch, fail_at)
+    out = tmp_path / "out"
+    assert tool.main([str(dump_path), "--out-dir", str(out)]) == 1
+    assert error_message(capsys.readouterr()) == "cannot write the output files: simulated failure"
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("fail_at", [1, 2, 3, 4, 5, 6])
+def test_a_failed_move_restores_the_existing_files(dump_path, tmp_path, capsys, monkeypatch, fail_at):
+    out = tmp_path / "out"
+    out.mkdir()
+    old = {name: f"old {name}".encode() for name in ("demo_rom.cROM", "demo_rom.cRP", "demo_rom-report.html")}
+    for name, content in old.items():
+        (out / name).write_bytes(content)
+    failing_replace(monkeypatch, fail_at)  # with --force every file takes two moves: set aside, then install
+    assert tool.main([str(dump_path), "--out-dir", str(out), "--force"]) == 1
+    assert error_message(capsys.readouterr()) == "cannot write the output files: simulated failure"
+    assert files_in(out) == sorted(old)
+    for name, content in old.items():
+        assert (out / name).read_bytes() == content, name
+
+
+def test_force_replaces_all_three_files_and_leaves_no_extra_files(dump_path, tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    for name in ("demo_rom.cROM", "demo_rom.cRP", "demo_rom-report.html"):
+        (out / name).write_bytes(b"old")
+    assert tool.main([str(dump_path), "--out-dir", str(out), "--force"]) == 0
+    assert files_in(out) == ["demo_rom-report.html", "demo_rom.cROM", "demo_rom.cRP"]
+    assert all((out / name).read_bytes() != b"old" for name in files_in(out))
 
 
 def test_two_runs_give_identical_files(dump_path, tmp_path):
@@ -3830,7 +4113,7 @@ def test_help_lists_every_option(capsys):
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `uv run --with pytest --with numpy pytest -q tests/test_cli.py`
-Expected: `18 failed`, with `AttributeError: module 'dmd_optimizer' has no attribute 'main'`.
+Expected: `28 failed`, with `AttributeError: module 'dmd_optimizer' has no attribute 'main'`.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -3862,6 +4145,29 @@ def build_parser():
     parser.add_argument("--no-shape-mode", action="store_true", help="compare exact pixel values only")
     parser.add_argument("--force", action="store_true", help="overwrite existing output files")
     return parser
+
+
+def install_files(temporary, targets):
+    """Move the finished files into place. If a move fails, put every target back as it was."""
+    moved = []  # (target, where its previous version was set aside or None)
+    try:
+        for source, target in zip(temporary, targets):
+            previous = None
+            if target.exists():
+                previous = target.with_name(target.name + ".old")
+                os.replace(target, previous)
+            moved.append((target, previous))
+            os.replace(source, target)
+    except OSError:
+        for target, previous in reversed(moved):
+            if previous is None:
+                target.unlink(missing_ok=True)
+            else:
+                os.replace(previous, target)
+        raise
+    for _, previous in moved:
+        if previous is not None:
+            previous.unlink()
 
 
 def run(args):
@@ -3907,8 +4213,7 @@ def run(args):
         out_dir.mkdir(parents=True, exist_ok=True)
         write_project(project, temporary[0], temporary[1])
         temporary[2].write_text(report_html(dump, analysis, rom_name), encoding="utf-8")
-        for source, target in zip(temporary, targets):
-            os.replace(source, target)
+        install_files(temporary, targets)
         done = True
     except OSError as error:
         raise OptimizerError(f"cannot write the output files: {error}") from None
@@ -3944,10 +4249,10 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `uv run --with pytest --with numpy pytest -q tests/test_cli.py`
-Expected: `18 passed`.
+Expected: `28 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `142 passed`.
+Expected: `164 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -4162,7 +4467,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_tools.py`
 Expected: `4 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `146 passed`.
+Expected: `168 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -4184,16 +4489,18 @@ Files:
 
 Design section 12.2. The user supplied a real dump (`twst_405.txt`, 14,443 records) and a hand-made project for the same ROM (`twst_405.crom`, `twst_405.cRP`). The files are large and are not committed; a script downloads them into `fixtures/` and checks their SHA-256.
 
-These tests check finished code against real files, so there is no failing step. They need network access for the download, about 1.5 GB of free memory and about 1 GB of disk space. The benchmark takes about one minute.
+These tests check finished code against real files, so there is no failing step. They need network access for the download, about 1.5 GB of free memory and about 1 GB of disk space. The run takes two to three minutes, because the dump is analysed twice.
 
 The tests cover:
 
 - the dump facts: 14,443 records, 10,301 distinct frames, 6,906 distinct shapes, 128x32, 4 shades, no warnings
 - reading the hand-made project and writing it back reproduces both files byte for byte
 - the hash of all 5,093 frames of the hand-made project is reproduced
-- the benchmark with default options: at most 4,500 kept frames, at most 64 masks, at most 3.5% of merged frames grouped differently by hand, and rules R2, R3 and R6 on every group
+- the benchmark with default options: at most 4,500 kept frames, at most 64 masks, and at most 3.5% of merged frames grouped differently by hand
+- rules R1 to R6 on the Twister result, checked by `check_rules`
+- a second analysis gives the same result (rule R7)
 
-"Grouped differently by hand" is defined in design section 12.2. `hand_labels` in the test file implements it.
+"Grouped differently by hand" is defined in design section 12.2. `hand_labels` in `tests/helpers.py` implements it by exact comparison.
 
 - [ ] **Step 1: Write the download script**
 
@@ -4324,6 +4631,7 @@ import pytest
 
 import dmd_optimizer as tool
 from conftest import TWISTER_CROM, TWISTER_CRP
+from helpers import check_rules, hand_labels
 
 pytestmark = pytest.mark.twister
 
@@ -4364,63 +4672,47 @@ def test_reference_hashes_are_reproduced(twister_reference):
         assert tool.frame_hash(frames[number], mask, bool(crom["ShapeCompMode"][number])) == expected, number
 
 
-def hand_labels(dump, reference):
-    """For every distinct dump frame: the lowest-numbered reference frame that identifies it, or -1."""
-    crom = reference.crom
-    masks = crom["CompMasks"].reshape(-1, PIXELS)
-    labels = np.full(len(dump.frames), -1, np.int64)
-    settings = sorted(set(zip(crom["CompMaskID"].tolist(), crom["ShapeCompMode"].tolist())))
-    for mask_number, shape in settings:
-        lowest = {}
-        chosen = np.flatnonzero((crom["CompMaskID"] == mask_number) & (crom["ShapeCompMode"] == shape))
-        for number in chosen[::-1]:
-            lowest[int(crom["HashCode"][number])] = int(number)
-        mask = None if mask_number == tool.NO_MASK else masks[mask_number]
-        for frame, value in enumerate(tool.frame_hashes(dump.frames, mask, bool(shape)).tolist()):
-            found = lowest.get(value, -1)
-            if found >= 0 and (labels[frame] < 0 or found < labels[frame]):
-                labels[frame] = found
-    return labels
-
-
 def test_benchmark_with_default_options(twister_dump, twister_reference, twister_analysis):
     dump, analysis = twister_dump, twister_analysis
-    groups = analysis.groups
-    labels = hand_labels(dump, twister_reference)
+    labels = hand_labels(dump.frames, twister_reference)
     assert int((labels >= 0).sum()) == 10275  # the hand-made project identifies all but 26 frames
 
     merged = different = 0
-    for group in groups:
+    for group in analysis.groups:
         if len(group.members) > 1:
             counts = collections.Counter(labels[group.members].tolist())
             merged += len(group.members)
             different += len(group.members) - counts.most_common(1)[0][1]
     share = 100.0 * different / merged
-    print(f"\nkept {len(groups)} of {len(dump.frames)} frames, {len(analysis.masks)} masks, "
+    print(f"\nkept {len(analysis.groups)} of {len(dump.frames)} frames, {len(analysis.masks)} masks, "
           f"grouped differently by hand: {different} of {merged} ({share:.1f}%), "
           f"CRC32 collisions: {len(analysis.collisions)}")
 
-    assert len(groups) <= 4500
+    assert len(analysis.groups) <= 4500
     assert len(analysis.masks) <= 64
     assert share <= 3.5
 
-    # rules R2, R3 and R6; analyze() has already verified R1 pixel by pixel
-    kept = [group.kept for group in groups]
-    assert kept == sorted(kept)
-    assert sum(len(group.members) for group in groups) == len(dump.frames)
-    for group in groups:
-        mask = analysis.masks[group.mask] if group.mask != tool.NO_MASK else np.zeros(PIXELS, bool)
-        assert mask.sum() + (group.varying & ~mask).sum() <= analysis.limit
-        if group.mask != tool.NO_MASK:
-            assert (dump.frames[group.kept] > 0)[~mask].sum() >= analysis.min_lit
-        if len(group.members) == 1:
-            assert (group.mask, group.shape) == (tool.NO_MASK, False)
+
+def test_rules_hold_on_the_twister_dump(twister_dump, twister_analysis):
+    check_rules(twister_dump, twister_analysis, tool.Options())  # rules R1 to R6, by exact comparison
+
+
+def test_a_second_analysis_gives_the_same_result(twister_dump, twister_analysis):
+    # Rule R7. The project files and the report are computed from the dump and the analysis
+    # alone, so equal analyses give byte-identical files (tests/test_cli.py checks that step).
+    first, second = twister_analysis, tool.analyze(twister_dump)
+    assert np.array_equal(first.masks, second.masks)
+    assert first.mask_saved == second.mask_saved and first.collisions == second.collisions
+    assert len(first.groups) == len(second.groups)
+    for a, b in zip(first.groups, second.groups):
+        assert (a.kept, a.mask, a.shape, a.hash) == (b.kept, b.mask, b.shape, b.hash)
+        assert np.array_equal(a.members, b.members) and np.array_equal(a.varying, b.varying)
 ```
 
 - [ ] **Step 5: Run the Twister tests**
 
 Run: `uv run --with pytest --with numpy pytest -q -s -m twister`
-Expected: `4 passed`, and among the output these two lines (the number of seconds will differ):
+Expected: `6 passed`, and among the output these two lines (the number of seconds will differ):
 
 ```text
 Twister analysis: 51 s
@@ -4432,7 +4724,7 @@ The numbers 4116, 43 and 196 of 7682 are exact for this dump. If they differ, or
 - [ ] **Step 6: Run the fast tests**
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `146 passed`, with 4 deselected.
+Expected: `168 passed`, with 6 deselected.
 
 - [ ] **Step 7: Commit**
 
@@ -4700,7 +4992,7 @@ If the library reports a problem, the assertion shows a list of `(record, kind, 
 - [ ] **Step 5: Run the fast tests**
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `146 passed`, with 6 deselected.
+Expected: `168 passed`, with 8 deselected.
 
 - [ ] **Step 6: Commit**
 
@@ -4797,10 +5089,10 @@ This prints every header value and field that differs between two projects.
 - [ ] **Step 2: Run every test**
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `146 passed`, with 6 deselected.
+Expected: `168 passed`, with 8 deselected.
 
 Run: `uv run --with pytest --with numpy pytest -q -s -m "twister or libserum"`
-Expected: `6 passed`, with 146 deselected.
+Expected: `8 passed`, with 168 deselected. This takes two to three minutes.
 
 - [ ] **Step 3: Run the tool on the Twister dump**
 
@@ -4858,8 +5150,8 @@ Differences in `cRP TimeElapsed` and in the editor interface state fields listed
 
 The work is complete when:
 
-- `uv run --with pytest --with numpy pytest -q` prints `146 passed`;
-- `uv run --with pytest --with numpy pytest -q -s -m "twister or libserum"` prints `6 passed`;
+- `uv run --with pytest --with numpy pytest -q` prints `168 passed`;
+- `uv run --with pytest --with numpy pytest -q -s -m "twister or libserum"` prints `8 passed`;
 - the two hand-offs of Tasks 20 and 22 have been given to the user.
 
 The two ColorizingDMD checks finish whenever the user returns the files. Their outcome is reported to the user; it does not block the commits above.

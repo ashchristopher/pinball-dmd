@@ -131,7 +131,7 @@ The file starts with inline script metadata so `uv run` installs numpy:
 | Option | Default | Meaning |
 |---|---|---|
 | `--out-dir DIR` | `<rom>-optimized` in the current folder | Where the three output files go |
-| `--rom-name NAME` | First dump's file name without extension | Name stored in the project and used for file names (at most 63 bytes) |
+| `--rom-name NAME` | First dump's file name without extension | Name stored in the project and used for file names: 1 to 63 ASCII characters, without path or wildcard characters |
 | `--max-vary PCT` | 25 | Percent of the display that may vary inside a merged group |
 | `--max-masks N` | 64 | Mask slots the tool may use (0–64) |
 | `--min-gain N` | 5 | Frames a candidate must save to be applied |
@@ -142,9 +142,16 @@ The file starts with inline script metadata so `uv run` installs numpy:
 `--max-masks 0 --no-shape-mode` merges nothing beyond exact duplicates. That mode is
 used for the fresh-import comparison in section 12.4.
 
-On success the tool prints the summary numbers of the report and the paths written,
-and exits with status 0. On any error in section 11 it prints one message to standard
-error and exits with status 1.
+While it works, the tool prints progress lines and warnings to standard error. On
+success it prints the summary numbers of the report and the paths written to standard
+output and exits with status 0. On any error in section 11 it prints one error
+message as the last line on standard error, prints nothing to standard output, and
+exits with status 1.
+
+The ROM name is limited to ASCII because the project stores it in a single-byte
+field whose meaning for other characters depends on the Windows code page. It is
+also a file name, so it may not contain any of `/ \ : * ? " < > |` and may not be
+`.` or `..`.
 
 ## 6. Reading dumps
 
@@ -157,8 +164,12 @@ The reader follows ColorizingDMD's `Parse_TXT` for the supported sizes.
 - W and H come from the first record of the first file. They must be 128x32 or
   192x64. Every record in every file must have the same size.
 - The project has 16 shades if any pixel value in any file exceeds 3, otherwise 4.
+- Blank lines are ignored everywhere, including between the rows of a record. The
+  editor ignores them too.
 - If a record has a short row, a missing row or any other character, reading of that
   file stops there with a warning and the earlier records are kept.
+- If other text follows the H rows of a complete record before the next timestamp
+  line, that record is kept and reading of the file stops after it, with a warning.
 - This is stricter than the editor in one respect. The editor also stops at a short
   row, a missing row and a non-alphanumeric character, but it accepts the letters
   `g`–`z` and turns them into pixel values above 15. No valid dump contains those
@@ -496,9 +507,12 @@ report are the 0-based positions of kept frames in the project.
 
 Content, in order:
 
-1. **Summary.** Dump files read, frames read, distinct frames, frames kept, masks
-   used, frames merged by shape mode alone, and the options of the run.
+1. **Summary.** Dump files read, frames read, distinct frames, frames kept, frames
+   kept unmerged, masks used, frames merged by shape mode alone, and the analysis
+   options of the run (`--max-vary`, `--max-masks`, `--min-gain`, `--min-lit` and
+   whether shape mode is on). The ROM name is in the title.
 2. **Warnings.**
+   - Warnings from reading the dumps.
    - CRC32 collisions found in step E.
    - Kept frames whose duration is under 15 ms, which the editor marks inactive until
      they are coloured.
@@ -545,11 +559,12 @@ docs/superpowers/specs/   this document
 
 ## 11. Errors
 
-The tool stops with one message, exit status 1, and no output files when:
+The tool stops with one error message, exit status 1, and no output files when:
 
 - a dump file cannot be read or contains no complete frame;
 - the frame size is not 128x32 or 192x64, or the dumps differ in size;
-- an option value is out of range;
+- an option value is out of range, or the ROM name is not usable (section 5);
+- the output files cannot be written;
 - an output file exists and `--force` was not given;
 - the verification in step E fails. This means a defect in the tool, and the message
   says so.
@@ -557,7 +572,10 @@ The tool stops with one message, exit status 1, and no output files when:
 A dump whose last record is incomplete is read up to that record, with a warning.
 
 Output files are written under temporary names in the output folder and renamed
-after all three are complete. A failed run removes its temporary files.
+after all three are complete. A failed run removes its temporary files. If a rename
+fails, every file that was already replaced is put back, so an existing project is
+either replaced completely or left exactly as it was. If the run created the output
+folder and nothing was written, the folder is removed.
 
 ## 12. Testing
 
@@ -610,7 +628,9 @@ tests are skipped when the files are absent.
   - at most 4,500 kept frames;
   - at most 64 masks;
   - at most 3.5% grouped differently by hand;
-  - R1–R7 hold.
+  - R1–R6 hold, checked by exact comparison in test code that shares nothing with
+    the tool;
+  - R7 holds: a second analysis gives the same result.
 
 **Grouped differently by hand.** For each distinct dump frame, find the reference
 frame with the lowest number that matches it under that reference frame's own mask
