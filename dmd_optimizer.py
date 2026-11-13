@@ -563,3 +563,43 @@ class Workspace:
         self.root[chosen] = earliest[labels[chosen]]
         self.group_mask[chosen] = number
         self.group_shape[chosen] = candidate.shape
+
+
+def choose_masks(work, regions, options):
+    """Step C of the design: merge groups, using at most options.max_masks regions."""
+    if options.shape_mode:
+        plain = Candidate(region=-1, mask=None, cells=None, blocks=None, area=0, shape=True)
+        labels, good, _ = work.mergeable(plain)
+        work.apply(plain, labels, good)
+    if options.max_masks <= 0 or not regions:
+        return
+    views = (False, True) if options.shape_mode else (False,)
+    candidates = [
+        work.candidate(number, region, shape)
+        for number, region in enumerate(regions)
+        for shape in views
+    ]
+
+    def rank(position, gain):
+        candidate = candidates[position]
+        score = gain * (1.0 - 0.5 * candidate.area / work.limit)
+        return (-score, candidate.area, candidate.region, candidate.shape, position)
+
+    queue = []
+    for position, candidate in enumerate(candidates):
+        gain = work.mergeable(candidate)[2]
+        if gain >= options.min_gain:
+            heapq.heappush(queue, rank(position, gain))
+    while queue:
+        position = heapq.heappop(queue)[-1]
+        candidate = candidates[position]
+        if candidate.region not in work.pool_of_region and len(work.pool) >= options.max_masks:
+            continue
+        labels, good, gain = work.mergeable(candidate)
+        if gain < options.min_gain:
+            continue
+        fresh = rank(position, gain)
+        if queue and queue[0] < fresh:
+            heapq.heappush(queue, fresh)
+            continue
+        work.apply(candidate, labels, good)
