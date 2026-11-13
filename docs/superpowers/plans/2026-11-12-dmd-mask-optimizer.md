@@ -3892,6 +3892,7 @@ The three files are written into a temporary folder with a unique name inside th
 - Without `--force` it first claims each name by creating the file exclusively (`open(target, "xb")`), which fails if the file exists. A file that appeared while the tool was working is therefore never overwritten.
 - With `--force` it first moves an existing file into the temporary folder.
 - It never replaces a folder. `run` refuses a folder that has the name of an output file before any work is done, and `install_files` puts back a folder that appears later.
+- A symbolic link under an output name counts as an existing file even when it points nowhere, which is why the code uses `os.path.lexists` and not `Path.exists`.
 - If a step fails, it puts everything back, so an existing project is either replaced completely or left exactly as it was.
 - If putting back fails as well, it raises `InstallError` naming the files to check by hand, and the temporary folder is kept because it holds the previous versions.
 
@@ -3919,6 +3920,7 @@ The tests cover:
 - a file that appears during the run, or while the files are being moved, is not overwritten
 - a failing removal of the empty output folder is a warning and keeps the error message last
 - a folder with the name of an output file is never replaced, with or without `--force`, including one that appears during the run
+- a symbolic link that points nowhere counts as an existing file and is put back after a failed forced run
 - `--force` replaces all three files, leaves no extra files and does not touch other files of the user
 - every failed run prints exactly one error line, last on standard error
 - two runs give byte-identical files (rule R7)
@@ -4215,6 +4217,26 @@ def test_a_folder_that_appears_during_a_forced_run_is_put_back(dump_path, tmp_pa
     assert (out / "demo_rom-report.html").read_bytes() == old["demo_rom-report.html"]
 
 
+def test_a_link_that_points_nowhere_counts_as_an_existing_file(dump_path, tmp_path, capsys, monkeypatch):
+    out = tmp_path / "out"
+    old = existing_outputs(out)
+    link = out / "demo_rom.cRP"
+    link.unlink()
+    try:
+        link.symlink_to("missing-target")
+    except (OSError, NotImplementedError):
+        pytest.skip("this system cannot create symbolic links")
+    assert tool.main([str(dump_path), "--out-dir", str(out)]) == 1  # refused without --force
+    assert error_message(capsys.readouterr()).endswith("already exists; pass --force to overwrite it")
+    failing_replace(monkeypatch, 6)  # the last of the six moves of a forced run fails
+    assert tool.main([str(dump_path), "--out-dir", str(out), "--force"]) == 1
+    assert error_message(capsys.readouterr()) == "cannot write the output files: simulated failure"
+    assert files_in(out) == sorted(old)
+    assert link.is_symlink() and str(link.readlink()) == "missing-target"  # the link is back
+    assert (out / "demo_rom.cROM").read_bytes() == old["demo_rom.cROM"]
+    assert (out / "demo_rom-report.html").read_bytes() == old["demo_rom-report.html"]
+
+
 def test_a_file_that_appears_while_the_files_are_moved_is_not_overwritten(dump_path, tmp_path, capsys, monkeypatch):
     out = tmp_path / "out"
     real = tool.os.replace
@@ -4286,7 +4308,7 @@ def test_help_lists_every_option(capsys):
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `uv run --with pytest --with numpy pytest -q tests/test_cli.py`
-Expected: `38 failed`, with `AttributeError: module 'dmd_optimizer' has no attribute 'main'`.
+Expected: `39 failed`, with `AttributeError: module 'dmd_optimizer' has no attribute 'main'`.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -4340,7 +4362,7 @@ def install_files(staged, targets, staging, force):
             previous = None
             if not force:
                 open(target, "xb").close()
-            elif target.exists():
+            elif os.path.lexists(target):  # lexists also sees a link that points nowhere
                 previous = staging / (target.name + ".previous")
                 os.replace(target, previous)
             moved.append((target, previous))
@@ -4353,7 +4375,7 @@ def install_files(staged, targets, staging, force):
             try:
                 if previous is not None:
                     os.replace(previous, target)
-                elif target.exists():
+                elif os.path.lexists(target):
                     os.remove(target)
             except OSError:
                 stranded.append(str(target if previous is None else previous))
@@ -4387,7 +4409,7 @@ def run(args):
     for target in targets:
         if target.is_dir() and not target.is_symlink():
             raise OptimizerError(f"{target} is a folder; the tool replaces files only")
-        if target.exists() and not args.force:
+        if os.path.lexists(target) and not args.force:
             raise OptimizerError(f"{target} already exists; pass --force to overwrite it")
 
     def say(message):
@@ -4461,10 +4483,10 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `uv run --with pytest --with numpy pytest -q tests/test_cli.py`
-Expected: `38 passed`.
+Expected: `39 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `187 passed`.
+Expected: `188 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -4679,7 +4701,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_tools.py`
 Expected: `4 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `191 passed`.
+Expected: `192 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -4936,7 +4958,7 @@ The numbers 4116, 43 and 196 of 7682 are exact for this dump. If they differ, or
 - [ ] **Step 6: Run the fast tests**
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `191 passed`, with 6 deselected.
+Expected: `192 passed`, with 6 deselected.
 
 - [ ] **Step 7: Commit**
 
@@ -5204,7 +5226,7 @@ If the library reports a problem, the assertion shows a list of `(record, kind, 
 - [ ] **Step 5: Run the fast tests**
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `191 passed`, with 8 deselected.
+Expected: `192 passed`, with 8 deselected.
 
 - [ ] **Step 6: Commit**
 
@@ -5301,10 +5323,10 @@ This prints every header value and field that differs between two projects.
 - [ ] **Step 2: Run every test**
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `191 passed`, with 8 deselected.
+Expected: `192 passed`, with 8 deselected.
 
 Run: `uv run --with pytest --with numpy pytest -q -s -m "twister or libserum"`
-Expected: `8 passed`, with 191 deselected. This takes two to three minutes.
+Expected: `8 passed`, with 192 deselected. This takes two to three minutes.
 
 - [ ] **Step 3: Run the tool on the Twister dump**
 
@@ -5362,7 +5384,7 @@ Differences in `cRP TimeElapsed` and in the editor interface state fields listed
 
 The work is complete when:
 
-- `uv run --with pytest --with numpy pytest -q` prints `191 passed`;
+- `uv run --with pytest --with numpy pytest -q` prints `192 passed`;
 - `uv run --with pytest --with numpy pytest -q -s -m "twister or libserum"` prints `8 passed`;
 - the two hand-offs of Tasks 20 and 22 have been given to the user.
 

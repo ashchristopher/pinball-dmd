@@ -586,6 +586,8 @@ output folder and moved into place after all three are complete.
   appeared while the tool was working is never overwritten.
 - With `--force`, an existing file is first moved into the temporary folder, and the
   new file then takes its place.
+- A symbolic link under an output file name counts as an existing file, even when it
+  points nowhere. Replacing it removes the link only, never what it points to.
 - A folder is never replaced, with or without `--force`. If a folder has the name of
   an output file, the tool stops with an error before doing any work. If such a
   folder appears during the run, it is put back and the run fails.
