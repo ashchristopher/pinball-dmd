@@ -97,3 +97,78 @@ def parse_dump_text(data, name):
     if not frames:
         raise OptimizerError(f"{name}: no complete frame found")
     return np.stack(frames), np.array(times, np.uint32), size, warning
+
+
+DEFAULT_FRAME_DURATION = 30  # ms, ColorizingDMD's value when a duration is unknown
+MAX_FRAME_DURATION = 4000  # ms, longer gaps are treated as unknown
+
+
+def frame_durations(times):
+    """Duration of each record by ColorizingDMD's rule: the time to the next record."""
+    durations = np.full(len(times), DEFAULT_FRAME_DURATION, np.uint32)
+    if len(times) > 1:
+        gap = times[1:].astype(np.int64) - times[:-1].astype(np.int64)
+        known = (gap >= 0) & (gap <= MAX_FRAME_DURATION)
+        durations[:-1][known] = gap[known]
+    return durations
+
+
+@dataclass
+class Dump:
+    """One or more dump files of the same ROM, with exact duplicate frames removed."""
+
+    width: int
+    height: int
+    shades: int  # 4 or 16
+    frames: np.ndarray  # uint8 [distinct frames, width * height], in order of first appearance
+    record_frame: np.ndarray  # int64 [records]: distinct frame number shown by each record
+    record_time: np.ndarray  # uint32 [records]: timestamp in milliseconds
+    record_duration: np.ndarray  # uint32 [records]: milliseconds on screen
+    record_file: np.ndarray  # int64 [records]: index into files
+    files: list
+    warnings: list
+
+
+def read_dumps(paths):
+    """Read dump files, in the order given, into one Dump."""
+    paths = [str(path) for path in paths]
+    size = None
+    parts = []
+    warnings = []
+    for path in paths:
+        try:
+            data = Path(path).read_bytes()
+        except OSError as error:
+            raise OptimizerError(f"{path}: cannot read the file ({error.strerror})") from None
+        frames, times, file_size, warning = parse_dump_text(data, path)
+        if size is None:
+            size = file_size
+        elif file_size != size:
+            raise OptimizerError(
+                f"{path}: frame size {file_size[0]}x{file_size[1]} differs from "
+                f"{size[0]}x{size[1]} in {paths[0]}"
+            )
+        if warning:
+            warnings.append(warning)
+        parts.append((frames, times))
+    index = {}
+    record_frame = []
+    for frames, _ in parts:
+        for row in frames:
+            record_frame.append(index.setdefault(row.tobytes(), len(index)))
+    width, height = size
+    distinct = np.frombuffer(b"".join(index), np.uint8).reshape(len(index), width * height)
+    return Dump(
+        width=width,
+        height=height,
+        shades=16 if int(distinct.max()) > 3 else 4,
+        frames=distinct,
+        record_frame=np.array(record_frame, np.int64),
+        record_time=np.concatenate([times for _, times in parts]),
+        record_duration=np.concatenate([frame_durations(times) for _, times in parts]),
+        record_file=np.concatenate(
+            [np.full(len(times), number, np.int64) for number, (_, times) in enumerate(parts)]
+        ),
+        files=paths,
+        warnings=warnings,
+    )
