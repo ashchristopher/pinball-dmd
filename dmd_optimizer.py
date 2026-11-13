@@ -351,3 +351,53 @@ def candidate_regions(view, links, limit, width, height):
         if count:
             varying[low] = joined
     return regions
+
+
+class Labeller:
+    """Labels frames so that equal labels mean "equal outside a mask" in one view.
+
+    Each 2x2 cell of each frame gets a 64-bit hash. The hash of a frame outside a
+    mask is the sum of the hashes of its unmasked cells, read from a table of
+    sums so that a rectangle costs four lookups per frame. Hash collisions are
+    possible in theory, which is why step E re-checks every result pixel by pixel.
+    """
+
+    def __init__(self, view, width, height):
+        rows, columns = height // CELL, width // CELL
+        weights = np.random.default_rng(20261112).integers(
+            1, 2**63, size=(rows, CELL, columns, CELL), dtype=np.uint64
+        )
+        # sums[f, y, x] is the sum of the cell hashes of frame f above row y and left of column x
+        self.sums = np.zeros((len(view), rows + 1, columns + 1), np.uint64)
+        for start in range(0, len(view), 1024):
+            block = view[start:start + 1024].reshape(-1, rows, CELL, columns, CELL)
+            cells = (block.astype(np.uint64) * weights).sum(axis=(2, 4))
+            self.sums[start:start + 1024, 1:, 1:] = cells.cumsum(axis=1).cumsum(axis=2)
+        self.total = self.sums[:, rows, columns].copy()
+
+    def labels(self, blocks=None):
+        """A label per frame. blocks lists the masked rectangles in cells, or is None."""
+        hashes = self.total
+        if blocks:
+            hashes = hashes.copy()
+            sums = self.sums
+            for top, bottom, left, right in blocks:
+                hashes -= sums[:, bottom, right] - sums[:, top, right] - sums[:, bottom, left] + sums[:, top, left]
+        return np.unique(hashes, return_inverse=True)[1]
+
+
+def mask_cells(mask, width, height):
+    """Indices of the 2x2 cells covered by a mask (bool [pixels]) on the 2-pixel grid."""
+    cells = np.asarray(mask, bool).reshape(height // CELL, CELL, width // CELL, CELL)[:, 0, :, 0]
+    return np.flatnonzero(cells)
+
+
+def mask_blocks(mask, width, height):
+    """The rectangles (top, bottom, left, right), in cells, that make up a padded mask."""
+    cells = np.asarray(mask, bool).reshape(height // CELL, CELL, width // CELL, CELL)[:, 0, :, 0]
+    found = []
+    _blocks(cells, 0, cells.shape[0], 0, cells.shape[1], found)
+    covered = sum((bottom - top) * (right - left) for top, bottom, left, right in found)
+    if covered != int(cells.sum()):
+        raise ValueError("mask is not a union of filled rectangles on the 2-pixel grid")
+    return found
