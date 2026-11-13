@@ -123,6 +123,7 @@ Create `.gitignore`:
 __pycache__/
 .pytest_cache/
 .cache/
+.worktrees/
 fixtures/
 handoff/
 *-optimized/
