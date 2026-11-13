@@ -158,8 +158,11 @@ The reader follows ColorizingDMD's `Parse_TXT` for the supported sizes.
   192x64. Every record in every file must have the same size.
 - The project has 16 shades if any pixel value in any file exceeds 3, otherwise 4.
 - If a record has a short row, a missing row or any other character, reading of that
-  file stops there with a warning and the earlier records are kept. The editor stops
-  at the same point.
+  file stops there with a warning and the earlier records are kept.
+- This is stricter than the editor in one respect. The editor also stops at a short
+  row, a missing row and a non-alphanumeric character, but it accepts the letters
+  `g`–`z` and turns them into pixel values above 15. No valid dump contains those
+  letters, so this tool treats them as invalid.
 
 Frame durations use the editor's rule. The duration of record `i` is
 `t[i+1] - t[i]`. It is 30 ms instead when the record is the last one in its file,
@@ -176,7 +179,9 @@ taking the files in the order given on the command line.
 - **Value view** of a frame: its pixel values.
 - **Shape view** of a frame: 1 where the pixel value is above 0, otherwise 0.
 - **Setting**: a mask (or no mask) together with a view. The value view is tighter
-  than the shape view. A smaller mask is tighter than a larger one.
+  than the shape view, and a mask contained in another mask is tighter than it. These
+  two comparisons are used in step B. They do not rank every pair of settings; where
+  one ranking is needed (rule R5), it is the order listed in step D.
 - **Match**: two frames match under a setting when their views are equal at every
   pixel outside the mask.
 - **Class** of a frame under a setting: all distinct dump frames that match it.
@@ -236,7 +241,11 @@ enabled. The shape view is enabled unless `--no-shape-mode` is given.
    the pixels at which the two earliest frames differ.
    - If `Vn` is empty, join the sets.
    - If `Vn` or `pad(Vn)` has more pixels than the limit, leave the sets apart.
-   - Otherwise join the sets, store `Vn`, and record `pad(Vn)` as a candidate region.
+   - Otherwise join the sets and record `pad(Vn)` as a candidate region.
+
+   Whenever two sets are joined, the joined set's V is `Vn` and its earliest frame is
+   the lower-numbered of the two earliest frames. A link whose two frames are already
+   in the same set is skipped.
 
 The candidate regions from both views are pooled and duplicates are removed, keeping
 discovery order.
@@ -272,8 +281,13 @@ current groups in the class minus one.
      group with the candidate's setting, and add its region to the pool if it is not
      there yet.
 
-Gains may be cached and re-evaluated lazily, but a candidate's gain must be
-recomputed against the current groups immediately before it is applied.
+Gains may be cached between rounds to save time, but nothing cached may be applied.
+Immediately before a candidate is applied, its mergeable classes (all three
+conditions of step B) and its gain must be derived afresh from the current groups. If
+the fresh gain no longer wins the round, the candidate goes back into the comparison
+with its fresh score.
+
+When the limit is 0 pixels there are no candidate regions and nothing is merged.
 
 **Step D: tightest setting per group.** For each group with more than one member, in
 kept-frame order, try settings in this order:
@@ -405,7 +419,8 @@ Notes:
 - The editor writes field 30 as 1 when the duration is at least 15 ms or the frame
   has been colourised. A new project has no colourised frames.
 - This layout reproduces the size of the reference `.crom` exactly (431,971,016
-  bytes), and the hash rule reproduces all 5,093 stored hashes.
+  bytes) with the counts stored in its header: nF 5,093, nM 64, nS 31, nB 2. The hash
+  rule reproduces all 5,093 stored hashes.
 - At 128x32 with 4 shades the file takes 83,950 bytes per frame plus 4,096 bytes per
   mask: about 360 MB for 4,300 frames.
 
@@ -464,9 +479,11 @@ This layout reproduces the size of the reference `.cRP` exactly (21,004,003 byte
   area as a whole percent of the display and F is the number of frames it saves, for
   example `auto-03 18% 212 frames`. Names are at most 30 bytes, the longest the
   editor accepts.
-- **Mask count.** nCompMasks is the number of masks in use. The editor sets it to the
-  highest mask number in use plus one, which is the same thing because masks are
-  numbered without gaps.
+- **Mask count.** The editor sets nCompMasks to the highest mask number assigned to
+  a frame plus one, and stores that many masks. This tool numbers its masks from 0
+  without gaps and drops unused ones (step E), so in its output nCompMasks equals the
+  number of masks in use. The reference project shows the difference: 52 masks are
+  assigned to frames, the highest is number 63, and its nCompMasks is 64.
 
 Every other field of a new project is written as ColorizingDMD's import code
 (`CopyTXTFrames2Frame`) initialises it; those are the values in the tables above.
@@ -564,6 +581,9 @@ These are fast and run on every change.
   - a screen that is blank outside the varying area: not merged (R3).
 - **Rules:** R1–R7 checked on every analysis result the tests produce, including
   that two runs give byte-identical files.
+- **Pool size (R4):** a dump with more useful candidate regions than `--max-masks`
+  allows; the result uses exactly that many masks and the frames of the turned-away
+  regions stay unmerged.
 - **Project files:** a new project has the sizes and values of section 8; a project
   written and read back is unchanged.
 - **Command line:** overwrite refusal, `--force`, `--rom-name`, error messages and
