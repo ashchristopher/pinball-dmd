@@ -571,7 +571,8 @@ The tool stops with one error message, exit status 1, and no output files when:
 - the frame size is not 128x32 or 192x64, or the dumps differ in size;
 - an option value is out of range, or the ROM name is not usable (section 5);
 - the output files cannot be written;
-- an output file exists and `--force` was not given;
+- an output file exists and `--force` was not given, or a folder has the name of an
+  output file;
 - the verification in step E fails. This means a defect in the tool, and the message
   says so.
 
@@ -585,6 +586,9 @@ output folder and moved into place after all three are complete.
   appeared while the tool was working is never overwritten.
 - With `--force`, an existing file is first moved into the temporary folder, and the
   new file then takes its place.
+- A folder is never replaced, with or without `--force`. If a folder has the name of
+  an output file, the tool stops with an error before doing any work. If such a
+  folder appears during the run, it is put back and the run fails.
 - If a step of the move fails, every file is put back as it was, so an existing
   project is either replaced completely or left exactly as it was.
 - If putting a file back fails as well, the temporary folder is left in place and the
