@@ -1316,7 +1316,7 @@ The tests cover:
 - frames that differ over more than the limit give no region
 - identical views give no region
 - no links give no region
-- a set is not joined when the union would exceed the limit
+- a set is not joined when the union would exceed the limit, nor when only the padded union would
 - the smallest difference is processed first
 
 - [ ] **Step 1: Write the failing test**
@@ -1380,6 +1380,17 @@ def test_a_set_is_not_joined_when_the_union_would_exceed_the_limit():
     assert all((region & changed_by_wide).sum() < changed_by_wide.sum() for region in regions)
 
 
+def test_a_set_is_not_joined_when_only_the_padded_union_exceeds_the_limit():
+    base = artwork()
+    sparse = base.copy()
+    sparse[4:29:4, 10:119:4] = 3  # 196 scattered pixels that form one block of 112 x 28 pixels when padded
+    view, regions = regions_of([base, sparse])
+    changed = view[0] != view[1]
+    assert 0 < int(changed.sum()) <= LIMIT
+    assert int(tool.pad_region(changed, W, H).sum()) == 112 * 28 > LIMIT
+    assert regions == []
+
+
 def test_smallest_difference_is_processed_first():
     base = artwork()
     small = base.copy()
@@ -1397,7 +1408,7 @@ def test_smallest_difference_is_processed_first():
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `uv run --with pytest --with numpy pytest -q tests/test_candidate_regions.py`
-Expected: `7 failed`, with `AttributeError: module 'dmd_optimizer' has no attribute 'candidate_regions'`.
+Expected: `8 failed`, with `AttributeError: module 'dmd_optimizer' has no attribute 'candidate_regions'`.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -1462,10 +1473,10 @@ def candidate_regions(view, links, limit, width, height):
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `uv run --with pytest --with numpy pytest -q tests/test_candidate_regions.py`
-Expected: `7 passed`.
+Expected: `8 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `49 passed`.
+Expected: `50 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -1634,7 +1645,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_labeller.py`
 Expected: `4 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `53 passed`.
+Expected: `54 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -1914,7 +1925,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_workspace.py`
 Expected: `7 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `60 passed`.
+Expected: `61 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -2084,7 +2095,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_choose_masks.py`
 Expected: `8 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `68 passed`.
+Expected: `69 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -2272,7 +2283,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_tighten.py`
 Expected: `6 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `74 passed`.
+Expected: `75 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -2523,7 +2534,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_finish.py`
 Expected: `8 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `82 passed`.
+Expected: `83 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -2850,7 +2861,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_analyze.py tests/te
 Expected: `22 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `104 passed`.
+Expected: `105 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -3211,7 +3222,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_project_files.py`
 Expected: `8 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `112 passed`.
+Expected: `113 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -3490,7 +3501,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_new_project.py`
 Expected: `27 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `139 passed`.
+Expected: `140 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -3865,7 +3876,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_report.py`
 Expected: `10 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `149 passed`.
+Expected: `150 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -4487,7 +4498,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_cli.py`
 Expected: `39 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `188 passed`.
+Expected: `189 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -4702,7 +4713,7 @@ Run: `uv run --with pytest --with numpy pytest -q tests/test_tools.py`
 Expected: `4 passed`.
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `192 passed`.
+Expected: `193 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -4959,7 +4970,7 @@ The numbers 4116, 43 and 196 of 7682 are exact for this dump. If they differ, or
 - [ ] **Step 6: Run the fast tests**
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `192 passed`, with 6 deselected.
+Expected: `193 passed`, with 6 deselected.
 
 - [ ] **Step 7: Commit**
 
@@ -5227,7 +5238,7 @@ If the library reports a problem, the assertion shows a list of `(record, kind, 
 - [ ] **Step 5: Run the fast tests**
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `192 passed`, with 8 deselected.
+Expected: `193 passed`, with 8 deselected.
 
 - [ ] **Step 6: Commit**
 
@@ -5324,10 +5335,10 @@ This prints every header value and field that differs between two projects.
 - [ ] **Step 2: Run every test**
 
 Run: `uv run --with pytest --with numpy pytest -q`
-Expected: `192 passed`, with 8 deselected.
+Expected: `193 passed`, with 8 deselected.
 
 Run: `uv run --with pytest --with numpy pytest -q -s -m "twister or libserum"`
-Expected: `8 passed`, with 192 deselected. This takes two to three minutes.
+Expected: `8 passed`, with 193 deselected. This takes two to three minutes.
 
 - [ ] **Step 3: Run the tool on the Twister dump**
 
@@ -5385,7 +5396,7 @@ Differences in `cRP TimeElapsed` and in the editor interface state fields listed
 
 The work is complete when:
 
-- `uv run --with pytest --with numpy pytest -q` prints `192 passed`;
+- `uv run --with pytest --with numpy pytest -q` prints `193 passed`;
 - `uv run --with pytest --with numpy pytest -q -s -m "twister or libserum"` prints `8 passed`;
 - the two hand-offs of Tasks 20 and 22 have been given to the user.
 
