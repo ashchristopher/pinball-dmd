@@ -416,3 +416,150 @@ def mask_blocks(mask, width, height):
     if covered != int(cells.sum()):
         raise ValueError("mask is not a union of filled rectangles on the 2-pixel grid")
     return found
+
+
+@dataclass
+class Candidate:
+    """A setting that could merge groups: a mask, or no mask, together with a view."""
+
+    region: int  # index into the candidate regions, -1 for "no mask"
+    mask: np.ndarray | None  # bool [pixels], None for "no mask"
+    cells: np.ndarray | None  # indices of the masked cells, None for "no mask"
+    blocks: list | None  # the masked rectangles in cells, None for "no mask"
+    area: int  # number of masked pixels
+    shape: bool  # True for the shape view, False for the value view
+    sound: np.ndarray | None = None  # classes that pass rules R2 and R3, filled on first use
+
+
+BATCH_FRAMES = 4096  # frames copied at a time when the members of classes or groups are compared
+
+
+def varying_batches(frames, order, starts):
+    """Find where the frames of each run differ, copying a bounded number of frames at a time.
+
+    order lists frame numbers and a run begins at every index in starts. Yields
+    (first, differ) for consecutive batches of runs: differ is bool [runs, pixels]
+    for the runs first, first + 1, ..., True where the frames of a run differ in value.
+    """
+    ends = np.append(starts[1:], len(order))
+    first = 0
+    while first < len(starts):
+        last = max(first + 1, int(np.searchsorted(ends, starts[first] + BATCH_FRAMES, side="right")))
+        rows = frames[order[starts[first]:ends[last - 1]]]
+        local = starts[first:last] - starts[first]
+        yield first, np.maximum.reduceat(rows, local, axis=0) != np.minimum.reduceat(rows, local, axis=0)
+        first = last
+
+
+class Workspace:
+    """The frames and the current groups during steps B to D of the design."""
+
+    def __init__(self, dump, options):
+        self.frames = dump.frames
+        self.width = dump.width
+        self.height = dump.height
+        count, pixels = self.frames.shape
+        self.limit = options.limit(pixels)
+        self.min_lit = options.lit_needed(pixels)
+        lit = self.frames > 0
+        rows, columns = self.height // CELL, self.width // CELL
+        self.lit_cells = (
+            lit.reshape(count, rows, CELL, columns, CELL)
+            .sum(axis=(2, 4), dtype=np.uint8)
+            .reshape(count, rows * columns)
+        )
+        self.lit_total = lit.sum(axis=1)
+        self.labellers = {False: Labeller(self.frames, self.width, self.height)}
+        if options.shape_mode:
+            # lit, read as bytes, is the shape view; using it saves a copy as large as the frames
+            self.labellers[True] = Labeller(lit.view(np.uint8), self.width, self.height)
+        del lit
+        self.root = np.arange(count)  # kept frame of the group each frame belongs to
+        self.group_mask = np.full(count, -1)  # pool index of that group's mask, -1 for no mask
+        self.group_shape = np.zeros(count, bool)  # True when that group uses the shape view
+        self.pool = []  # chosen regions as Candidate objects (their view is not used)
+        self.pool_of_region = {}  # candidate region index -> pool index
+
+    def candidate(self, region, mask, shape):
+        return Candidate(
+            region=region,
+            mask=mask,
+            cells=mask_cells(mask, self.width, self.height),
+            blocks=mask_blocks(mask, self.width, self.height),
+            area=int(mask.sum()),
+            shape=shape,
+        )
+
+    def lit_outside(self, frames, cells):
+        """Lit pixels of the given frames outside the masked cells."""
+        return self.lit_total[frames] - self.lit_cells[frames][:, cells].sum(axis=1)
+
+    def mergeable(self, candidate):
+        """Step B: judge a candidate against the current groups.
+
+        Returns (labels, good, gain): labels is the class of every frame under the
+        candidate, good says for every class whether it is mergeable, and gain is
+        the number of frames that merging the good classes would save.
+        """
+        labels = self.labellers[candidate.shape].labels(candidate.blocks)
+        count = len(labels)
+        classes = int(labels.max()) + 1
+        pairs = np.unique(labels * count + self.root)
+        groups = np.bincount(pairs // count, minlength=classes)
+        good = groups > 1
+        if candidate.sound is None:
+            # Groups only ever merge, so the classes holding two or more groups now
+            # include every class that can hold two or more groups later.
+            candidate.sound = np.flatnonzero(self._sound(labels, good, candidate))
+        sound = np.zeros(classes, bool)
+        sound[candidate.sound] = True
+        good &= sound
+        allowed = np.ones(count, bool)
+        for number, chosen in enumerate(self.pool):
+            if candidate.mask is None or (chosen.mask & ~candidate.mask).any():
+                allowed &= self.group_mask != number
+        if not candidate.shape:
+            allowed &= ~self.group_shape
+        good &= np.bincount(labels, weights=~allowed, minlength=classes) == 0
+        return labels, good, int((groups[good] - 1).sum())
+
+    def _sound(self, labels, wanted, candidate):
+        """Rules R2 and R3 for the classes flagged in wanted.
+
+        The answer depends only on which frames are in a class, so it never changes.
+        """
+        sound = wanted.copy()
+        frames = np.flatnonzero(sound[labels])
+        if candidate.mask is not None and len(frames):
+            dark = self.lit_outside(frames, candidate.cells) < self.min_lit
+            sound[labels[frames[dark]]] = False
+            frames = frames[sound[labels[frames]]]
+        if candidate.shape and len(frames):
+            # In the value view the members of a class differ only inside the mask.
+            frames = frames[np.argsort(labels[frames], kind="stable")]
+            classes = labels[frames]
+            starts = np.flatnonzero(np.concatenate(([True], classes[1:] != classes[:-1])))
+            for first, differ in varying_batches(self.frames, frames, starts):
+                if candidate.mask is not None:
+                    differ &= ~candidate.mask
+                batch = classes[starts[first:first + len(differ)]]
+                sound[batch] = differ.sum(axis=1) + candidate.area <= self.limit
+        return sound
+
+    def apply(self, candidate, labels, good):
+        """Merge the groups of every good class into one group with the candidate's setting."""
+        chosen = good[labels]
+        if not chosen.any():
+            return
+        number = -1
+        if candidate.mask is not None:
+            number = self.pool_of_region.get(candidate.region)
+            if number is None:
+                number = len(self.pool)
+                self.pool.append(candidate)
+                self.pool_of_region[candidate.region] = number
+        earliest = np.full(len(good), len(labels))
+        np.minimum.at(earliest, labels[chosen], self.root[chosen])
+        self.root[chosen] = earliest[labels[chosen]]
+        self.group_mask[chosen] = number
+        self.group_shape[chosen] = candidate.shape
